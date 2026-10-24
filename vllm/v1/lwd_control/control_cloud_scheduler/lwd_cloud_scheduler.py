@@ -105,6 +105,15 @@ class LwdCloudScheduler(LwdBaseScheduler):
         # I/O); the engine post_step flushes them to the edge in one shot --
         # the edge side pre-posts DOWN recvs accordingly
         self.pending_c2e: list[LwdC2eNotify] = []
+        # Gateway billing ledger. Prompt tokens are captured at admission
+        # (by the time a request finishes, native accounting has already
+        # removed it from self.requests); completion tokens accumulate from
+        # the same accepted counts that drive the finish decision. Both are
+        # pure data here -- the engine publishes them in post_step.
+        self.pending_gateway_usage: list[tuple[str, int, int]] = []
+        self.pending_gateway_aborts: list[str] = []
+        self._lwd_gateway_prompt_tokens: dict[str, int] = {}
+        self._lwd_gateway_completion: dict[str, int] = {}
 
     def update_from_output(self, scheduler_output, model_runner_output):
         """After native accounting (including spec observation), unpack the
@@ -167,6 +176,12 @@ class LwdCloudScheduler(LwdBaseScheduler):
             )
         elif LwdControlDiag.disable_down_enabled():
             self._lwd_append_diag_c2e(engine_core_outputs)
+        # Gateway billing, carrier-independent: the finish decision and the
+        # accepted counts are both derivable from engine_core_outputs, so
+        # this also covers carrier-less steps (abort with nothing on the
+        # wire) and the DISABLE_DOWN diagnostics bypass -- not just the
+        # carrier path.
+        self._lwd_collect_gateway_usage(engine_core_outputs)
         return engine_core_outputs
 
     def _lwd_append_diag_c2e(self, engine_core_outputs) -> None:
@@ -236,6 +251,90 @@ class LwdCloudScheduler(LwdBaseScheduler):
             req_ids=list(req_ids),
             down_seqno=seqno,
         )
+
+    def add_request(self, request) -> None:
+        """Record the prompt length for billing at admission.
+
+        By the time a request finishes, native accounting has already removed
+        it from ``self.requests``; and the cloud never sees real prompt ids
+        (only the embeds row count), so this is the one place the length is
+        both available and stable.
+        """
+        self._lwd_gateway_prompt_tokens[request.request_id] = (
+            request.num_prompt_tokens
+        )
+        super().add_request(request)
+
+    def _lwd_collect_gateway_usage(self, engine_core_outputs) -> None:
+        """Accumulate accepted tokens; queue usage for finished requests.
+
+        Reads only ``engine_core_outputs`` (no carrier), so billing covers
+        carrier-less finishes such as an abort with nothing on the wire and
+        the DISABLE_DOWN diagnostics bypass -- the finish decision and the
+        accepted counts are the same ones that end a request.
+        Queued, never sent: the scheduler stays free of I/O and the engine
+        flushes ``pending_gateway_usage`` in ``post_step`` (it drains the list
+        whether or not the billing endpoint is enabled, so nothing accumulates
+        when the gateway is off).
+        """
+        # Accepted counts, computed the same way the c2e carrier computes
+        # them (last-wins per rank within a step), accumulated per request.
+        committed: dict[str, int] = {}
+        for outputs in engine_core_outputs.values():
+            for out in outputs.outputs:
+                if out.new_token_ids:
+                    committed[out.request_id] = len(out.new_token_ids)
+        for request_id, accepted in committed.items():
+            self._lwd_gateway_completion[request_id] = (
+                self._lwd_gateway_completion.get(request_id, 0) + accepted
+            )
+        # A real finish_reason means the request ended normally; appearing in
+        # finished_requests without one is an abort -- the same distinction
+        # _lwd_c2e_finish_reasons draws. An abort with any accepted token has
+        # provably completed its prefill and is billed like a finished
+        # request; an abort with zero accepted tokens declines: billing its
+        # declared prompt would be an estimate, not a measurement (the same
+        # reason this plane never sends fabricated zeros elsewhere).
+        # The two write forms below are deliberately asymmetric: finish_reason
+        # overrides, finished_requests only fills, so a natural finish wins
+        # over the abort inference regardless of parcel order -- do not
+        # "unify" them into one form.
+        finished: dict[str, bool] = {}
+        for outputs in engine_core_outputs.values():
+            for out in outputs.outputs:
+                if out.finish_reason is not None:
+                    finished[out.request_id] = False
+            for request_id in outputs.finished_requests or ():
+                finished.setdefault(request_id, True)
+        for request_id, aborted in finished.items():
+            prompt_tokens = self._lwd_gateway_prompt_tokens.pop(request_id, 0)
+            completion_tokens = self._lwd_gateway_completion.pop(request_id, 0)
+            if aborted:
+                if completion_tokens > 0 and prompt_tokens > 0:
+                    self.pending_gateway_usage.append(
+                        (request_id, prompt_tokens, completion_tokens)
+                    )
+                else:
+                    if completion_tokens <= 0 and prompt_tokens > 0:
+                        lwd_logger.debug(
+                            "[gateway] aborted before any accepted token "
+                            "req=%s prompt=%d: not billed (undeclared part "
+                            "of the prompt is only nominal)",
+                            request_id,
+                            prompt_tokens,
+                        )
+                    self.pending_gateway_aborts.append(request_id)
+                continue
+            if prompt_tokens <= 0:
+                lwd_logger.warning(
+                    "[gateway] no prompt length recorded for req=%s; "
+                    "that request cannot be billed",
+                    request_id,
+                )
+                continue
+            self.pending_gateway_usage.append(
+                (request_id, prompt_tokens, completion_tokens)
+            )
 
     @staticmethod
     def _lwd_c2e_finish_reasons(req_ids: list[str], engine_core_outputs) -> list[int]:

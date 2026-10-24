@@ -68,6 +68,9 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
         from vllm_ascend.worker.lwd_cloud_model.lwd_pre_recv import create_hint_mq
 
         self._lwd_hint_mq = create_hint_mq()
+        # Gateway billing endpoint (None when disabled); started in
+        # _lwd_assemble once lwd_config is resolved.
+        self._lwd_gateway = None
         super().__init__(*args, lwd_dp_size=lwd_dp_size, **kwargs)
         # The cloud endpoint worker created its done-report MQ during
         # init_device; now that the executor is up, fetch its handle over
@@ -115,6 +118,24 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
         self._lwd_ingest_thread.start()
         plane = self._lwd_start_control_plane()
         lwd_logger.info("[cloud] engine assembled: control plane on %s", plane.endpoint)
+        self._lwd_start_gateway_server()
+
+    def _lwd_start_gateway_server(self) -> None:
+        """Serve the gateway billing endpoint from this process.
+
+        Usage is produced here, so the HTTP server lives here too: no mp
+        queues, no ZMQ side channel, and the engine thread only hands finished
+        requests over with ``call_soon_threadsafe``.
+        """
+        gateway = getattr(self.lwd_config, "gateway", None)
+        if gateway is None or not gateway.enabled:
+            return
+        from vllm.v1.lwd_control.lwd_gateway.lwd_gateway_server import (
+            LwdGatewayControlServer,
+        )
+
+        self._lwd_gateway = LwdGatewayControlServer(gateway)
+        self._lwd_gateway.start()
 
     def _lwd_decode(self, payload: bytes) -> LwdMessage:
         return lwd_decode_edge_to_cloud(payload)
@@ -362,4 +383,20 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
             for notify in self.scheduler.pending_c2e:
                 self._lwd_send_until_queued(self._lwd_edge, notify)
             self.scheduler.pending_c2e.clear()
+        # Billing flush: drained whether or not the endpoint is enabled, so
+        # nothing accumulates when the gateway is off.
+        if self.scheduler.pending_gateway_usage:
+            records = self.scheduler.pending_gateway_usage
+            self.scheduler.pending_gateway_usage = []
+            if self._lwd_gateway is not None:
+                for request_id, prompt_tokens, completion_tokens in records:
+                    self._lwd_gateway.publish_usage(
+                        request_id, prompt_tokens, completion_tokens
+                    )
+        if self.scheduler.pending_gateway_aborts:
+            aborts = self.scheduler.pending_gateway_aborts
+            self.scheduler.pending_gateway_aborts = []
+            if self._lwd_gateway is not None:
+                for request_id in aborts:
+                    self._lwd_gateway.publish_aborted(request_id)
         super().post_step(model_executed)

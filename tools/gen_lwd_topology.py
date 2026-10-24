@@ -122,6 +122,7 @@ def build_topology(
     listen_host: str = "0.0.0.0",
     listen_port: int = 8100,
     control_url: str | None = None,
+    enable_gateway: bool = False,
 ) -> dict[str, Any]:
     """Allocate global ranks; host-local physical devices remain launch settings."""
     if scene not in SCENES:
@@ -197,6 +198,27 @@ def build_topology(
                 "listen_host": listen_host,
                 "listen_port": listen_port,
             }
+    if enable_gateway:
+        # Billing through the platform gateway is scene-independent: it needs
+        # no tenant key and reserves nothing, so single_instance is legal.
+        gateway_url = control_url
+        if gateway_url is None:
+            cloud_ip = cloud_instances[0][1]
+            gateway_url = f"http://{cloud_ip}:{listen_port}/v1/chat/completions"
+        consumers = [cid.strip() for cid in consumer_ids.split(",")]
+        for i, edge in enumerate(edges):
+            edge["gateway"] = {
+                "enabled": True,
+                "control_url": gateway_url,
+                "consumer_id": consumers[i % len(consumers)],
+                "connect_timeout": connect_timeout,
+            }
+        for cloud in clouds:
+            cloud["gateway"] = {
+                "enabled": True,
+                "listen_host": listen_host,
+                "listen_port": listen_port,
+            }
     return result
 
 
@@ -266,6 +288,14 @@ def main() -> None:
         help="cloud_share only: cloud-side coordination service listen port",
     )
     parser.add_argument(
+        "--enable-gateway",
+        action="store_true",
+        help=(
+            "emit a per-instance gateway block (billing through the platform "
+            "gateway); works in any scene, reuses --control-url/--listen-*"
+        ),
+    )
+    parser.add_argument(
         "-o", "--output", type=Path, required=True, help="One output YAML file"
     )
     args = parser.parse_args()
@@ -283,6 +313,7 @@ def main() -> None:
             connect_timeout=args.connect_timeout,
             listen_host=args.listen_host,
             listen_port=args.listen_port,
+            enable_gateway=args.enable_gateway,
         )
         raw["feature_ctrl"] = {
             "enable_early_recv": args.enable_early_recv,
