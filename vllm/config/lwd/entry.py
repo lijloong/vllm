@@ -10,6 +10,7 @@ from typing_extensions import TypedDict
 
 from .api import LwdAPIConfig
 from .coordination import LwdCoordinationConfig
+from .gateway import LwdGatewayConfig
 from .topology import LwdDPConnection, LwdId, LwdInstance, LwdString, LwdTopology
 
 
@@ -28,6 +29,7 @@ class LwdConfig:
     topology: LwdTopology
     coordination: LwdCoordinationConfig | None = None
     api: LwdAPIConfig = field(default_factory=LwdAPIConfig)
+    gateway: LwdGatewayConfig | None = None
 
     def __post_init__(self) -> None:
         self.api.validate_topology(self)
@@ -55,6 +57,14 @@ class LwdConfig:
                 cloud_id=identity if role == "cloud" else None,
             )
             coordination.validate_role(role)
+        gateway = None
+        # gateway is embedded in each instance too, but is scene-independent.
+        if instance.gateway is not None:
+            gateway = LwdGatewayConfig.from_dict(
+                asdict(instance.gateway),
+                cloud_id=identity if role == "cloud" else None,
+            )
+            gateway.validate_role(role)
         return cls(
             path,
             role,
@@ -62,6 +72,7 @@ class LwdConfig:
             topology,
             coordination,
             api=api if api is not None else LwdAPIConfig(),
+            gateway=gateway,
         )
 
     @property

@@ -119,6 +119,38 @@ class LwdCoordination:
 
 
 @dataclass(frozen=True, config=ConfigDict(extra="forbid"))
+class LwdGateway:
+    """Gateway billing block, embedded per instance.
+
+    Unlike `coordination` it is scene-independent: one edge and one cloud is a
+    legal deployment, and there is no tenant key because nothing is cached.
+    """
+
+    enabled: StrictBool = False
+    # Edge-side fields
+    control_url: LwdString | None = None
+    consumer_id: LwdString | None = None
+    # Cloud-side fields
+    listen_host: LwdString = "0.0.0.0"
+    listen_port: LwdPort = 8100
+    # Shared
+    connect_timeout: Annotated[float, Field(strict=True, gt=0, allow_inf_nan=False)] = (
+        10.0
+    )
+    heartbeat_interval: LwdPositiveSeconds = 10.0
+    usage_wait_timeout: LwdPositiveSeconds = 600.0
+
+    @field_validator("control_url")
+    @classmethod
+    def validate_url(cls, value: str | None) -> str | None:
+        if value is not None:
+            url = urlsplit(value)
+            if url.scheme not in ("http", "https") or not url.hostname:
+                raise ValueError("[LWD] control_url must be an HTTP(S) endpoint")
+        return value
+
+
+@dataclass(frozen=True, config=ConfigDict(extra="forbid"))
 class LwdDP:
     dp_idx: LwdId
     addr: Annotated[StrictStr, AfterValidator(_address)]
@@ -131,6 +163,7 @@ class LwdInstance:
     id: LwdId
     dp: Annotated[tuple[LwdDP, ...], Field(min_length=1)]
     coordination: LwdCoordination | None = None
+    gateway: LwdGateway | None = None
 
     @field_validator("dp")
     @classmethod

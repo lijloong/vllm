@@ -203,6 +203,8 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         )
         self.scheduler.lwd_admit_request(request)
         self._lwd_notify_request(request)
+        # Gateway billing stream: fire and forget, never gates admission.
+        self._lwd_submit_gateway_billing(request)
         super().add_request(request)
 
     def abort_requests(self, request_ids: list[str]) -> None:
@@ -211,6 +213,14 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         abort-notify feature is not landed yet and will be completed
         together with that feature."""
         self.scheduler.lwd_edge_abort(request_ids)
+        # Close the matching billing streams at the same time: an aborted
+        # request must not keep a gateway connection open waiting for a usage
+        # frame that can never arrive now. No-lazy: abort alone must not spin
+        # up the billing client.
+        billing = getattr(self, "_lwd_gateway_billing", None)
+        if billing is not None:
+            for request_id in request_ids:
+                billing.abort(request_id)
         super().abort_requests(request_ids)
 
     def _lwd_notify_request(self, request: Request) -> None:
@@ -233,3 +243,38 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
                 **values,
             )
         )
+
+    def _lwd_gateway_client(self):
+        """Lazily build the billing client; None when the gateway is off."""
+        gateway = getattr(self.lwd_config, "gateway", None)
+        if gateway is None or not gateway.enabled:
+            return None
+        client = getattr(self, "_lwd_gateway_billing", None)
+        if client is None:
+            from vllm.v1.lwd_control.lwd_gateway.lwd_gateway_client import (
+                LwdGatewayBillingClient,
+            )
+
+            model_config = self.vllm_config.model_config
+            served = getattr(model_config, "served_model_name", None)
+            if isinstance(served, (list, tuple)):
+                served = served[0] if served else None
+            client = LwdGatewayBillingClient(
+                gateway,
+                str(served or model_config.model),
+                edge_id=self.lwd_config.instance_id,
+            )
+            self._lwd_gateway_billing = client
+        return client
+
+    def _lwd_submit_gateway_billing(self, request: Request) -> None:
+        """Open this request's billing stream through the platform gateway.
+
+        Deliberately not awaited: there is no reuse decision to make here, so
+        gating admission on a gateway round trip would only add latency. Any
+        failure stays a warning inside the client.
+        """
+        client = self._lwd_gateway_client()
+        if client is None:
+            return
+        client.submit(request.request_id, request.num_prompt_tokens)
