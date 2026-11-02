@@ -48,6 +48,13 @@ class LwdGatewayControlServer:
     """SSE control endpoint plus the usage hand-off from the engine thread."""
 
     def __init__(self, gateway: LwdGatewayConfig) -> None:
+        if not isinstance(gateway.listen_port, int):
+            # One process serves one cloud DP: the engine resolves this DP's
+            # entry of a per-DP port list before constructing the server.
+            raise ValueError(
+                "[LWD] gateway server needs one resolved listen_port; "
+                "the per-DP list belongs to the engine"
+            )
         self._gateway = gateway
         self._loop: asyncio.AbstractEventLoop | None = None
         self._waiters: dict[str, asyncio.Future] = {}

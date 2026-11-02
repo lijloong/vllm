@@ -15,12 +15,15 @@ GENERATOR = ROOT / "tools/gen_lwd_topology.py"
 
 
 def generate(
-    output: Path, **options: str | int | None
+    output: Path, **options: str | int | bool | None
 ) -> subprocess.CompletedProcess[str]:
     command = [sys.executable, str(GENERATOR), "-o", str(output)]
     for name, value in options.items():
-        if value is not None:
-            command.extend([f"--{name.replace('_', '-')}", str(value)])
+        if value is None:
+            continue
+        flag = f"--{name.replace('_', '-')}"
+        # True means a bare store_true flag; anything else takes a value.
+        command.append(flag) if value is True else command.extend([flag, str(value)])
     return subprocess.run(command, capture_output=True, text=True)
 
 
@@ -286,3 +289,86 @@ def test_rejected_input_preserves_existing_yaml(
     assert result.returncode != 0
     assert match in result.stderr
     assert output.read_text() == "keep existing yaml\n"
+
+
+# --------------------------------------------------------------------- #
+# gateway billing endpoints                                             #
+# --------------------------------------------------------------------- #
+_GATEWAY_BASE = {
+    "scene": "single_instance",
+    "edge_machines": "76.76.26.194",
+    "cloud_machines": "76.76.26.192",
+    "cloud_cards": "0:16",
+    "listen_port": 9188,
+    "enable_gateway": True,
+}
+
+
+def _gateway_topology(tmp_path: Path, **options) -> dict:
+    output = tmp_path / "topology.yaml"
+    generate(output, **(_GATEWAY_BASE | options)).check_returncode()
+    return yaml.safe_load(output.read_text())
+
+
+def test_gateway_single_dp_keeps_scalar_endpoints(tmp_path: Path) -> None:
+    raw = _gateway_topology(tmp_path, dp=1)
+    assert (
+        raw["edges"][0]["gateway"]["control_url"]
+        == "http://76.76.26.192:9188/v1/chat/completions"
+    )
+    assert raw["clouds"][0]["gateway"]["listen_port"] == 9188
+
+
+def test_gateway_multi_dp_gets_one_endpoint_per_dp(tmp_path: Path) -> None:
+    """Every cloud DP is its own process with its own endpoint, so a multi-DP
+    deployment must not be handed one shared URL or one shared port."""
+    raw = _gateway_topology(tmp_path, dp=2)
+    assert raw["clouds"][0]["gateway"]["listen_port"] == [9188, 9189]
+    assert raw["edges"][0]["gateway"]["control_url"] == [
+        f"http://76.76.26.192:{port}/v1/chat/completions" for port in (9188, 9189)
+    ]
+
+
+def test_gateway_multi_dp_takes_one_explicit_url_per_dp(tmp_path: Path) -> None:
+    urls = [
+        "http://gw.example.com/dp0/v1/chat/completions",
+        "http://gw.example.com/dp1/v1/chat/completions",
+    ]
+    raw = _gateway_topology(
+        tmp_path,
+        dp=2,
+        gateway_control_urls=",".join(urls),
+        listen_port=8100,
+    )
+    assert raw["edges"][0]["gateway"]["control_url"] == urls
+
+
+def test_gateway_single_dp_still_reuses_the_control_url(tmp_path: Path) -> None:
+    url = "http://gw.internal:9133/v1/chat/completions"
+    raw = _gateway_topology(tmp_path, dp=1, control_url=url)
+    assert raw["edges"][0]["gateway"]["control_url"] == url
+
+
+def test_gateway_refuses_one_url_for_several_dps(tmp_path: Path) -> None:
+    output = tmp_path / "topology.yaml"
+    result = generate(
+        output,
+        **(
+            _GATEWAY_BASE
+            | {"dp": 2, "control_url": "http://gw.example.com/v1/chat/completions"}
+        ),
+    )
+    assert result.returncode != 0
+    assert "--gateway-control-urls" in result.stderr
+    assert not output.exists()
+
+
+def test_gateway_ports_must_not_collide_with_ctrl_port(tmp_path: Path) -> None:
+    output = tmp_path / "topology.yaml"
+    result = generate(
+        output,
+        **(_GATEWAY_BASE | {"dp": 2, "port_base": 9188}),
+    )
+    assert result.returncode != 0
+    assert "collide" in result.stderr
+    assert not output.exists()

@@ -340,8 +340,13 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         Deliberately not awaited: there is no reuse decision to make here, so
         gating admission on a gateway round trip would only add latency. Any
         failure stays a warning inside the client.
+
+        The stream is addressed to the cloud DP the scheduler pinned at
+        admission: usage is published by that DP's own process, so any other
+        endpoint would wait for a usage frame that never comes.
         """
         client = self._lwd_gateway_client()
         if client is None:
             return
-        client.submit(request.request_id, request.num_prompt_tokens)
+        dp_idx = self.scheduler.lwd_request_dp(request.request_id)
+        client.submit(request.request_id, request.num_prompt_tokens, dp_idx)

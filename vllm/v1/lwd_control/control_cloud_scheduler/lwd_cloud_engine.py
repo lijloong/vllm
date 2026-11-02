@@ -11,10 +11,12 @@ from __future__ import annotations
 import queue
 import threading
 import time
+from dataclasses import replace
 from typing import Any
 
 import torch
 
+from vllm.config.lwd.gateway import LwdGatewayConfig
 from vllm.lwd_logger import lwd_logger
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.interface import PauseState
@@ -134,7 +136,8 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
 
         Usage is produced here, so the HTTP server lives here too: no mp
         queues, no ZMQ side channel, and the engine thread only hands finished
-        requests over with ``call_soon_threadsafe``.
+        requests over with ``call_soon_threadsafe``. Every cloud DP runs one of
+        these, so each resolves its own port and name from the shared block.
         """
         gateway = getattr(self.lwd_config, "gateway", None)
         if gateway is None or not gateway.enabled:
@@ -143,8 +146,27 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
             LwdGatewayControlServer,
         )
 
-        self._lwd_gateway = LwdGatewayControlServer(gateway)
+        self._lwd_gateway = LwdGatewayControlServer(
+            self._lwd_gateway_server_config(gateway)
+        )
         self._lwd_gateway.start()
+
+    def _lwd_gateway_server_config(
+        self, gateway: LwdGatewayConfig
+    ) -> LwdGatewayConfig:
+        """Resolve this DP's slice of the instance-wide gateway block.
+
+        A per-DP port is what lets several DPs share a host (each binds its
+        own socket). The instance id gains the DP rank once there are several:
+        billing for a request is only ever answered by the DP that ran it, so
+        an edge log that sees a bare ``cloud-0`` from every DP cannot say which
+        one answered.
+        """
+        dp_rank = int(self.vllm_config.parallel_config.data_parallel_index or 0)
+        config = replace(gateway, listen_port=gateway.listen_port_for(dp_rank))
+        if self._lwd_dp_size <= 1:
+            return config
+        return replace(config, instance_id=f"{config.instance_id}-dp{dp_rank}")
 
     def _lwd_decode(self, payload: bytes) -> LwdMessage:
         return lwd_decode_edge_to_cloud(payload)

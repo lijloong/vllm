@@ -123,6 +123,7 @@ def build_topology(
     listen_port: int = 8100,
     control_url: str | None = None,
     enable_gateway: bool = False,
+    gateway_control_urls: str | None = None,
 ) -> dict[str, Any]:
     """Allocate global ranks; host-local physical devices remain launch settings."""
     if scene not in SCENES:
@@ -201,15 +202,62 @@ def build_topology(
     if enable_gateway:
         # Billing through the platform gateway is scene-independent: it needs
         # no tenant key and reserves nothing, so single_instance is legal.
-        gateway_url = control_url
-        if gateway_url is None:
+        # Both endpoints are per cloud DP: every cloud DP is its own process
+        # with its own endpoint, so multi-DP needs one port and one URL per DP.
+        # Single DP keeps the scalar form (and --control-url reuse) unchanged.
+        if listen_port + dp - 1 > 65535:
+            raise ValueError("All generated gateway ports must be within 1..65535")
+        gateway_ports = [listen_port + index for index in range(dp)]
+        if gateway_control_urls is not None:
+            gateway_urls = [
+                url.strip() for url in gateway_control_urls.split(",") if url.strip()
+            ]
+        elif control_url is not None:
+            if dp > 1:
+                # One URL cannot address several DPs, and reusing it for all of
+                # them is exactly the shape that loses billing: the stream then
+                # lands on whichever DP the gateway picks.
+                raise ValueError(
+                    "--control-url addresses one endpoint and cannot serve "
+                    f"{dp} cloud DPs; pass --gateway-control-urls (one per DP) "
+                    "or omit both to derive per-DP URLs"
+                )
+            # One DP: the coordination URL addresses it, as before.
+            gateway_urls = [control_url]
+        else:
             cloud_ip = cloud_instances[0][1]
-            gateway_url = f"http://{cloud_ip}:{listen_port}/v1/chat/completions"
+            gateway_urls = [
+                f"http://{cloud_ip}:{port}/v1/chat/completions"
+                for port in gateway_ports
+            ]
+        if len(gateway_urls) != dp:
+            raise ValueError(
+                f"--gateway-control-urls count ({len(gateway_urls)}) must match "
+                f"the cloud DP count ({dp})"
+            )
+        # Cloud DPs of one instance share a host, so their gateway sockets and
+        # their ZMQ control ports would collide on that host.
+        gateway_port_set = set(gateway_ports)
+        for cloud in clouds:
+            overlap = gateway_port_set & {
+                dp_entry["ctrl_port"] for dp_entry in cloud["dp"]
+            }
+            if overlap:
+                raise ValueError(
+                    f"gateway ports {sorted(overlap)} collide with ctrl_port on "
+                    f"cloud {cloud['id']}; move --listen-port or --port-base"
+                )
+        control_url_value: str | list[str] = (
+            gateway_urls[0] if dp == 1 else gateway_urls
+        )
+        listen_port_value: int | list[int] = (
+            gateway_ports[0] if dp == 1 else gateway_ports
+        )
         consumers = [cid.strip() for cid in consumer_ids.split(",")]
         for i, edge in enumerate(edges):
             edge["gateway"] = {
                 "enabled": True,
-                "control_url": gateway_url,
+                "control_url": control_url_value,
                 "consumer_id": consumers[i % len(consumers)],
                 "connect_timeout": connect_timeout,
             }
@@ -217,7 +265,7 @@ def build_topology(
             cloud["gateway"] = {
                 "enabled": True,
                 "listen_host": listen_host,
-                "listen_port": listen_port,
+                "listen_port": listen_port_value,
             }
     return result
 
@@ -267,7 +315,9 @@ def main() -> None:
         "--control-url",
         default=None,
         help=(
-            "cloud_share only: edge->cloud control service URL; auto-derived if omitted"
+            "cloud_share only: edge->cloud control service URL; auto-derived if "
+            "omitted. With --enable-gateway on a single DP it also serves as the "
+            "billing URL"
         ),
     )
     parser.add_argument(
@@ -292,7 +342,16 @@ def main() -> None:
         action="store_true",
         help=(
             "emit a per-instance gateway block (billing through the platform "
-            "gateway); works in any scene, reuses --control-url/--listen-*"
+            "gateway); works in any scene, reuses --control-url/--listen-* for "
+            "a single DP and derives one port per DP otherwise"
+        ),
+    )
+    parser.add_argument(
+        "--gateway-control-urls",
+        default=None,
+        help=(
+            "gateway billing URLs, comma-separated, one per cloud DP; "
+            "auto-derived per DP from the cloud IP and --listen-port if omitted"
         ),
     )
     parser.add_argument(
@@ -314,6 +373,7 @@ def main() -> None:
             listen_host=args.listen_host,
             listen_port=args.listen_port,
             enable_gateway=args.enable_gateway,
+            gateway_control_urls=args.gateway_control_urls,
         )
         raw["feature_ctrl"] = {
             "enable_early_recv": args.enable_early_recv,

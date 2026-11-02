@@ -83,8 +83,15 @@ class LwdGatewayBillingClient:
         asyncio.set_event_loop(self._loop)
         self._loop.run_forever()
 
-    def submit(self, request_id: str, prompt_tokens: int) -> None:
+    def submit(
+        self, request_id: str, prompt_tokens: int, dp_idx: int | None = None
+    ) -> None:
         """Open this request's billing stream; returns immediately.
+
+        ``dp_idx`` is the cloud DP the request was pinned to. Each cloud DP
+        publishes usage from its own process, so the stream must be addressed
+        to that DP's endpoint: with a per-DP pair of endpoints, an unknown DP
+        is declined rather than guessed.
 
         Called from the engine thread. Never raises: a dead loop means no
         billing for this request, which is still better than failing admission.
@@ -96,7 +103,15 @@ class LwdGatewayBillingClient:
                 "[gateway] billing client closed, req=%s not billed", request_id
             )
             return
-        coroutine = self._stream(request_id, prompt_tokens)
+        url = self._gateway.control_url_for(dp_idx)
+        if url is None:
+            lwd_logger.warning(
+                "[gateway] no billing endpoint for req=%s dp=%s; not billed",
+                request_id,
+                dp_idx,
+            )
+            return
+        coroutine = self._stream(request_id, prompt_tokens, url, dp_idx)
         try:
             asyncio.run_coroutine_threadsafe(coroutine, self._loop)
         except RuntimeError:
@@ -164,7 +179,9 @@ class LwdGatewayBillingClient:
             self._session = aiohttp.ClientSession()
         return self._session
 
-    async def _stream(self, request_id: str, prompt_tokens: int) -> None:
+    async def _stream(
+        self, request_id: str, prompt_tokens: int, url: str, dp_idx: int | None
+    ) -> None:
         import aiohttp
 
         task = asyncio.current_task()
@@ -184,7 +201,7 @@ class LwdGatewayBillingClient:
                 total=None, connect=self._gateway.connect_timeout
             )
             response = await session.post(
-                self._gateway.control_url,
+                url,
                 json=body,
                 headers=headers,
                 timeout=timeout,
@@ -192,17 +209,19 @@ class LwdGatewayBillingClient:
             try:
                 if response.status != 200:
                     lwd_logger.warning(
-                        "[gateway] billing stream rejected req=%s status=%d "
+                        "[gateway] billing stream rejected req=%s dp=%s status=%d "
                         "body=%s",
                         request_id,
+                        dp_idx,
                         response.status,
                         await self._error_body(response),
                     )
                     return
                 lwd_logger.debug(
-                    "[gateway] billing stream open req=%s via=%s",
+                    "[gateway] billing stream open req=%s dp=%s via=%s",
                     request_id,
-                    self._gateway.control_url,
+                    dp_idx,
+                    url,
                 )
                 await self._drain(request_id, response)
             finally:
@@ -211,8 +230,9 @@ class LwdGatewayBillingClient:
             raise
         except Exception as exc:  # noqa: BLE001 - billing is best effort
             lwd_logger.warning(
-                "[gateway] billing stream failed req=%s: %s: %s",
+                "[gateway] billing stream failed req=%s dp=%s: %s: %s",
                 request_id,
+                dp_idx,
                 type(exc).__name__,
                 exc,
             )

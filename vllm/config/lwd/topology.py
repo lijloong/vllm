@@ -76,6 +76,19 @@ class LwdFeatures:
 
 LwdPositiveSeconds = Annotated[float, Field(strict=True, gt=0, allow_inf_nan=False)]
 
+# Gateway endpoints are per cloud DP: one value, or one per cloud DP in dp_idx
+# order. Every cloud DP is its own process with its own endpoint, and usage is
+# only ever published on the DP that ran the request, so a multi-DP deployment
+# must address each DP separately.
+LwdPerDpUrl = LwdString | Annotated[tuple[LwdString, ...], Field(min_length=1)]
+LwdPerDpPort = LwdPort | Annotated[tuple[LwdPort, ...], Field(min_length=1)]
+
+
+def check_http_url(url: str) -> None:
+    parsed = urlsplit(url)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise ValueError("[LWD] control_url must be an HTTP(S) endpoint")
+
 
 @dataclass(frozen=True, config=ConfigDict(extra="forbid"))
 class LwdControlPlaneConfig:
@@ -112,9 +125,7 @@ class LwdCoordination:
     @classmethod
     def validate_url(cls, value: str | None) -> str | None:
         if value is not None:
-            url = urlsplit(value)
-            if url.scheme not in ("http", "https") or not url.hostname:
-                raise ValueError("[LWD] control_url must be an HTTP(S) endpoint")
+            check_http_url(value)
         return value
 
 
@@ -128,11 +139,17 @@ class LwdGateway:
 
     enabled: StrictBool = False
     # Edge-side fields
-    control_url: LwdString | None = None
+    control_url: LwdPerDpUrl | None = None
+    """Billing endpoint per cloud DP: one URL for every DP, or one per DP in
+    dp_idx order. A multi-DP deployment needs the list form -- each cloud DP
+    publishes usage from its own process, so a single fan-out URL would leave
+    every request that lands on another DP unbilled."""
     consumer_id: LwdString | None = None
     # Cloud-side fields
     listen_host: LwdString = "0.0.0.0"
-    listen_port: LwdPort = 8100
+    listen_port: LwdPerDpPort = 8100
+    """Listen port per cloud DP: one port for every DP, or one per DP for a
+    deployment whose DPs share a host."""
     # Shared
     connect_timeout: Annotated[float, Field(strict=True, gt=0, allow_inf_nan=False)] = (
         10.0
@@ -142,11 +159,11 @@ class LwdGateway:
 
     @field_validator("control_url")
     @classmethod
-    def validate_url(cls, value: str | None) -> str | None:
-        if value is not None:
-            url = urlsplit(value)
-            if url.scheme not in ("http", "https") or not url.hostname:
-                raise ValueError("[LWD] control_url must be an HTTP(S) endpoint")
+    def validate_url(cls, value: LwdPerDpUrl | None) -> LwdPerDpUrl | None:
+        if value is None:
+            return value
+        for url in (value,) if isinstance(value, str) else value:
+            check_http_url(url)
         return value
 
 

@@ -62,6 +62,74 @@ def test_control_url_must_be_http(url: str) -> None:
         LwdGatewayConfig(control_url=url)
 
 
+def test_per_dp_control_url_must_cover_every_cloud_dp() -> None:
+    gateway = LwdGatewayConfig(
+        enabled=True,
+        control_url=(
+            "http://gw-a:8100/v1/chat/completions",
+            "http://gw-b:8100/v1/chat/completions",
+        ),
+    )
+    gateway.validate_role("edge", cloud_dp_size=2)
+    assert gateway.control_url_for(0) == "http://gw-a:8100/v1/chat/completions"
+    assert gateway.control_url_for(1) == "http://gw-b:8100/v1/chat/completions"
+    with pytest.raises(ValueError, match="one per cloud DP"):
+        gateway.validate_role("edge", cloud_dp_size=3)
+
+
+def test_one_control_url_still_serves_every_cloud_dp() -> None:
+    url = "https://gw.example.com/v1/chat/completions"
+    gateway = LwdGatewayConfig(enabled=True, control_url=url)
+    gateway.validate_role("edge", cloud_dp_size=2)
+    assert {gateway.control_url_for(dp) for dp in (0, 1)} == {url}
+    assert gateway.control_url_for(None) == url
+
+
+def test_unknown_dp_has_no_endpoint_with_a_per_dp_list() -> None:
+    """Guessing a DP would meter usage the owner DP never published."""
+    gateway = LwdGatewayConfig(
+        enabled=True,
+        control_url=(
+            "http://gw-a:8100/v1/chat/completions",
+            "http://gw-b:8100/v1/chat/completions",
+        ),
+    )
+    assert gateway.control_url_for(None) is None
+    assert gateway.control_url_for(2) is None
+
+
+def test_a_bad_url_inside_the_per_dp_list_is_rejected() -> None:
+    with pytest.raises(ValueError):
+        LwdGatewayConfig(
+            control_url=(
+                "http://gw-a:8100/v1/chat/completions",
+                "ftp://gw-b/v1/chat/completions",
+            )
+        )
+
+
+def test_cloud_listen_ports_are_per_dp() -> None:
+    gateway = LwdGatewayConfig(enabled=True, listen_port=(9188, 9189))
+    gateway.validate_role("cloud", cloud_dp_size=2)
+    assert [gateway.listen_port_for(dp) for dp in (0, 1)] == [9188, 9189]
+    with pytest.raises(ValueError, match="one per cloud DP"):
+        gateway.validate_role("cloud", cloud_dp_size=3)
+
+
+def test_topology_twin_carries_the_per_dp_lists() -> None:
+    yaml_block = LwdGateway(
+        enabled=True,
+        control_url=(
+            "http://gw-a:8100/v1/chat/completions",
+            "http://gw-b:8100/v1/chat/completions",
+        ),
+        listen_port=(9188, 9189),
+    )
+    runtime = LwdGatewayConfig.from_dict(dataclasses.asdict(yaml_block))
+    assert runtime.control_url == yaml_block.control_url
+    assert runtime.listen_port == yaml_block.listen_port
+
+
 def test_from_dict_derives_the_instance_id_on_the_cloud() -> None:
     cloud = LwdGatewayConfig.from_dict({"enabled": True}, cloud_id=2)
     assert cloud.instance_id == "cloud-2"

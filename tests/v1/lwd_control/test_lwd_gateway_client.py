@@ -148,6 +148,36 @@ def test_submit_sends_the_shadow_request_and_drains_to_done() -> None:
     assert response.close_calls == 1
 
 
+def test_per_dp_list_addresses_the_pinned_cloud_dp() -> None:
+    """Each cloud DP publishes usage in its own process, so the stream has to
+    be addressed to the DP the scheduler pinned -- not to whichever endpoint
+    a load balancer would pick."""
+    urls = (f"{CONTROL_URL}?dp=0", f"{CONTROL_URL}?dp=1")
+    client = _client(_gateway(control_url=urls))
+    response = _FakeResponse(_sse_stream())
+    session = _attach(client, response)
+    try:
+        client.submit(RID, 8, 1)
+        _wait_until(lambda: response.close_calls == 1, "stream close")
+    finally:
+        client.close()
+    assert [call["url"] for call in session.calls] == [urls[1]]
+
+
+def test_unknown_dp_with_a_per_dp_list_is_not_billed() -> None:
+    client = _client(
+        _gateway(control_url=(CONTROL_URL, "http://gw-b:8100/v1/chat/completions"))
+    )
+    response = _FakeResponse(_sse_stream())
+    session = _attach(client, response)
+    try:
+        client.submit(RID, 8)  # dp unknown: no endpoint to address
+        time.sleep(0.1)
+    finally:
+        client.close()
+    assert session.calls == []
+
+
 def test_api_key_is_sent_as_bearer(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("VLLM_LWD_GATEWAY_API_KEY", "sk-gw-token")
     client = _client()

@@ -64,7 +64,17 @@ class LwdConfig:
                 asdict(instance.gateway),
                 cloud_id=identity if role == "cloud" else None,
             )
-            gateway.validate_role(role)
+            # A per-DP endpoint list is validated against the real cloud DP
+            # count; both roles read it from the shared topology, exactly like
+            # LwdConfig.cloud_dp_size below.
+            gateway.validate_role(
+                role,
+                cloud_dp_size=len(
+                    topology.instance(
+                        "cloud", topology.connections(role, identity)[0].cloud_id
+                    ).dp
+                ),
+            )
         return cls(
             path,
             role,
