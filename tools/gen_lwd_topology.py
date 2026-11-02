@@ -13,7 +13,7 @@ import yaml
 SCENES = ("single_instance", "edge_share", "cloud_share", "lwd_cluster")
 
 
-def _instances(value: str) -> list[tuple[int, str]]:
+def _instances(value: str) -> list[tuple[int, str | tuple[str, ...]]]:
     items = [item.strip() for item in value.split(",")]
     explicit = "@" in value
     instances = []
@@ -27,15 +27,20 @@ def _instances(value: str) -> list[tuple[int, str]]:
             index = int(identity)
         else:
             address = item
-        instances.append((index, str(ip_address(address))))
+        # `ID@IP1+IP2` places one DP per host in dp_idx order; a single IP
+        # keeps every DP of the instance on that host.
+        hosts = tuple(str(ip_address(host)) for host in address.split("+"))
+        instances.append((index, hosts[0] if len(hosts) == 1 else hosts))
     if not explicit and len({addr for _, addr in instances}) != len(instances):
         raise ValueError("Repeated addresses require explicit ID@address entries")
     return sorted(instances)
 
 
-def _edge_instances(scene: str, value: str, cloud_count: int) -> list[tuple[int, str]]:
+def _edge_instances(
+    scene: str, value: str, cloud_count: int
+) -> list[tuple[int, str | tuple[str, ...]]]:
     if scene == "edge_share":
-        if "@" in value or "," in value:
+        if "@" in value or "," in value or "+" in value:
             raise ValueError(
                 "edge_share requires one plain edge IP; edge IDs follow cloud IDs"
             )
@@ -47,19 +52,27 @@ def _edge_instances(scene: str, value: str, cloud_count: int) -> list[tuple[int,
 
 
 def _instance(
-    identity: int, address: str, ranks: list[list[int]], port_base: int | None = None
+    identity: int,
+    address: str | tuple[str, ...],
+    ranks: list[list[int]],
+    ports: list[int] | None = None,
 ) -> dict[str, Any]:
+    hosts = (address,) * len(ranks) if isinstance(address, str) else address
     dps = []
     for index, group in enumerate(ranks):
-        item: dict[str, Any] = {"dp_idx": index, "addr": address, "ranks": group}
-        if port_base is not None:
-            item["ctrl_port"] = port_base + index
+        item: dict[str, Any] = {
+            "dp_idx": index,
+            "addr": hosts[index],
+            "ranks": group,
+        }
+        if ports is not None:
+            item["ctrl_port"] = ports[index]
         dps.append(item)
     return {"id": identity, "dp": dps}
 
 
 def _cloud_layout(
-    instances: list[tuple[int, str, int]],
+    instances: list[tuple[int, str | tuple[str, ...], int]],
     dp: int,
     edge_rank_count: int,
     port_base: int,
@@ -67,6 +80,8 @@ def _cloud_layout(
     shared_ports: bool = False,
 ) -> list[dict[str, Any]]:
     next_rank = edge_rank_count
+    # Keyed by host: DPs of different instances may share a host, and two
+    # processes cannot bind one port there.
     next_ports: dict[str, int] = {}
     clouds = []
     for identity, address, cards in instances:
@@ -75,16 +90,25 @@ def _cloud_layout(
             list(range(start, start + per_dp))
             for start in range(next_rank, next_rank + cards, per_dp)
         ]
-        port = next_ports.get(address, port_base)
-        clouds.append(_instance(identity, address, ranks, port))
+        hosts = (address,) * dp if isinstance(address, str) else address
+        if shared_ports:
+            # edge_share reuses one control channel per DP index across
+            # instances: same numbers everywhere, and nothing to allocate.
+            ports = [port_base + index for index in range(dp)]
+        else:
+            ports = []
+            for host in hosts:
+                port = next_ports.get(host, port_base)
+                ports.append(port)
+                next_ports[host] = port + 1
+        clouds.append(_instance(identity, hosts, ranks, ports))
         next_rank += cards
-        # edge_share reuses edge-side channels; other scenes bind per cloud DP.
-        if not shared_ports:
-            next_ports[address] = port + dp
     return clouds
 
 
-def _cloud_instances(machines: str, cards: str, dp: int) -> list[tuple[int, str, int]]:
+def _cloud_instances(
+    machines: str, cards: str, dp: int
+) -> list[tuple[int, str | tuple[str, ...], int]]:
     instances = _instances(machines)
     allocations: dict[int, int] = {}
     for item in cards.split(","):
@@ -103,9 +127,20 @@ def _cloud_instances(machines: str, cards: str, dp: int) -> list[tuple[int, str,
         allocations[identity] = count
     if set(allocations) != {identity for identity, _ in instances}:
         raise ValueError("--cloud-cards must specify every cloud instance exactly once")
-    return [
-        (identity, address, allocations[identity]) for identity, address in instances
-    ]
+    result = []
+    for identity, hosts in instances:
+        if isinstance(hosts, tuple):
+            if len(hosts) != dp:
+                raise ValueError(
+                    f"cloud {identity} needs one host per DP ({dp}), got {len(hosts)}"
+                )
+            if len(set(hosts)) != dp:
+                raise ValueError(
+                    f"cloud {identity} per-DP hosts must be distinct; "
+                    "drop the '+' to keep every DP of an instance on one host"
+                )
+        result.append((identity, hosts, allocations[identity]))
+    return result
 
 
 def build_topology(
@@ -207,7 +242,19 @@ def build_topology(
         # Single DP keeps the scalar form (and --control-url reuse) unchanged.
         if listen_port + dp - 1 > 65535:
             raise ValueError("All generated gateway ports must be within 1..65535")
-        gateway_ports = [listen_port + index for index in range(dp)]
+        cloud_hosts = cloud_instances[0][1]
+        cloud_hosts = (
+            (cloud_hosts,) * dp if isinstance(cloud_hosts, str) else cloud_hosts
+        )
+        one_dp_per_host = len(set(cloud_hosts)) == dp
+        # DPs that share a host need distinct ports; DPs on their own hosts can
+        # all use the same one, which is also what a hand-written topology for
+        # that shape looks like.
+        gateway_ports = (
+            [listen_port] * dp
+            if one_dp_per_host
+            else [listen_port + index for index in range(dp)]
+        )
         if gateway_control_urls is not None:
             gateway_urls = [
                 url.strip() for url in gateway_control_urls.split(",") if url.strip()
@@ -225,33 +272,35 @@ def build_topology(
             # One DP: the coordination URL addresses it, as before.
             gateway_urls = [control_url]
         else:
-            cloud_ip = cloud_instances[0][1]
             gateway_urls = [
-                f"http://{cloud_ip}:{port}/v1/chat/completions"
-                for port in gateway_ports
+                f"http://{host}:{port}/v1/chat/completions"
+                for host, port in zip(cloud_hosts, gateway_ports)
             ]
         if len(gateway_urls) != dp:
             raise ValueError(
                 f"--gateway-control-urls count ({len(gateway_urls)}) must match "
                 f"the cloud DP count ({dp})"
             )
-        # Cloud DPs of one instance share a host, so their gateway sockets and
-        # their ZMQ control ports would collide on that host.
-        gateway_port_set = set(gateway_ports)
+        # A gateway socket and a ZMQ control port must not share a host:port.
         for cloud in clouds:
-            overlap = gateway_port_set & {
-                dp_entry["ctrl_port"] for dp_entry in cloud["dp"]
+            ports = {
+                (dp_entry["addr"], dp_entry["ctrl_port"]) for dp_entry in cloud["dp"]
             }
-            if overlap:
+            clash = [
+                (dp_entry["addr"], port)
+                for dp_entry, port in zip(cloud["dp"], gateway_ports)
+                if (dp_entry["addr"], port) in ports
+            ]
+            if clash:
                 raise ValueError(
-                    f"gateway ports {sorted(overlap)} collide with ctrl_port on "
+                    f"gateway endpoints {clash} collide with ctrl_port on "
                     f"cloud {cloud['id']}; move --listen-port or --port-base"
                 )
         control_url_value: str | list[str] = (
             gateway_urls[0] if dp == 1 else gateway_urls
         )
         listen_port_value: int | list[int] = (
-            gateway_ports[0] if dp == 1 else gateway_ports
+            gateway_ports[0] if one_dp_per_host else gateway_ports
         )
         consumers = [cid.strip() for cid in consumer_ids.split(",")]
         for i, edge in enumerate(edges):
@@ -281,7 +330,7 @@ def main() -> None:
     parser.add_argument("--scene", required=True, choices=SCENES)
     for name, help_text in (
         ("edge-machines", "Edge IPs; cloud_share requires ID@IP per instance"),
-        ("cloud-machines", "Cloud IPs; edge_share requires ID@IP per instance"),
+        ("cloud-machines", "Cloud IPs; ID@IP1+IP2 places one DP per host"),
         ("cloud-cards", "Comma-separated ID:card_count for every cloud instance"),
     ):
         parser.add_argument(f"--{name}", required=True, help=help_text)

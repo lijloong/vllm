@@ -372,3 +372,75 @@ def test_gateway_ports_must_not_collide_with_ctrl_port(tmp_path: Path) -> None:
     assert result.returncode != 0
     assert "collide" in result.stderr
     assert not output.exists()
+
+
+# --------------------------------------------------------------------- #
+# per-DP cloud hosts                                                    #
+# --------------------------------------------------------------------- #
+def test_cloud_dps_can_live_on_separate_hosts(tmp_path: Path) -> None:
+    """`ID@IP1+IP2` places one DP per host; ranks still split by DP."""
+    output = tmp_path / "topology.yaml"
+    generate(
+        output,
+        scene="single_instance",
+        edge_machines="76.76.26.194",
+        cloud_machines="0@76.76.26.192+76.76.26.193",
+        cloud_cards="0:16",
+        dp=2,
+    ).check_returncode()
+    raw = yaml.safe_load(output.read_text())
+    assert [dp["addr"] for dp in raw["clouds"][0]["dp"]] == [
+        "76.76.26.192",
+        "76.76.26.193",
+    ]
+    assert [dp["ranks"] for dp in raw["clouds"][0]["dp"]] == [
+        list(range(1, 9)),
+        list(range(9, 17)),
+    ]
+    # separate hosts may share a port; they are not bind conflicts
+    assert [dp["ctrl_port"] for dp in raw["clouds"][0]["dp"]] == [5550, 5550]
+
+
+@pytest.mark.parametrize(
+    "clouds,match",
+    [
+        ("0@76.76.26.192+76.76.26.193+76.76.26.194", "one host per DP (2), got 3"),
+        ("0@76.76.26.192+76.76.26.192", "must be distinct"),
+    ],
+)
+def test_cloud_per_dp_hosts_are_validated(
+    tmp_path: Path, clouds: str, match: str
+) -> None:
+    output = tmp_path / "topology.yaml"
+    result = generate(
+        output,
+        scene="single_instance",
+        edge_machines="76.76.26.194",
+        cloud_machines=clouds,
+        cloud_cards="0:16",
+        dp=2,
+    )
+    assert result.returncode != 0
+    assert match in result.stderr
+    assert not output.exists()
+
+
+def test_gateway_follows_the_host_of_each_dp(tmp_path: Path) -> None:
+    """One DP per host: same port everywhere, URL host per DP."""
+    output = tmp_path / "topology.yaml"
+    generate(
+        output,
+        scene="single_instance",
+        edge_machines="76.76.26.194",
+        cloud_machines="0@76.76.26.192+76.76.26.193",
+        cloud_cards="0:16",
+        dp=2,
+        listen_port=9188,
+        enable_gateway=True,
+    ).check_returncode()
+    raw = yaml.safe_load(output.read_text())
+    assert raw["clouds"][0]["gateway"]["listen_port"] == 9188
+    assert raw["edges"][0]["gateway"]["control_url"] == [
+        "http://76.76.26.192:9188/v1/chat/completions",
+        "http://76.76.26.193:9188/v1/chat/completions",
+    ]
