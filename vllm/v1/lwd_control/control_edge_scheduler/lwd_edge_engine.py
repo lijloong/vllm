@@ -296,7 +296,10 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             control.add_request(request)
             return
         submission = self._lwd_probe_manager.submit(request)
-        if submission is not LwdProbeSubmission.UNAVAILABLE:
+        if submission is LwdProbeSubmission.SUBMITTED:
+            return
+        if submission is LwdProbeSubmission.FAILED:
+            self._lwd_abort_internally(request)
             return
         self._lwd_add_request_after_probe(request)
 
@@ -387,49 +390,21 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
     def _lwd_preferred_connection(
         self, completion: LwdProbeCompletion | None
     ) -> LwdConnectionId | None:
-        if completion is None or not completion.activated:
+        if completion is None:
             return None
         return completion.connection_id
 
     def _lwd_drain_probe_completions(self) -> None:
         for completion in self._lwd_probe_manager.drain():
-            if not completion.activated:
-                if not completion.candidates:
-                    lwd_logger.warning(
-                        "[edge-probe] all candidates failed req=%s targets=%s; "
-                        "using full prefill",
-                        completion.request.request_id,
-                        completion.failed_targets,
-                    )
-                hits = {
-                    candidate.connection_id: candidate.normalized_hit_tokens(
-                        completion.request.num_prompt_tokens
-                    )
-                    for candidate in completion.candidates
-                }
-                target = self.scheduler.lwd_select_probe_target(
-                    completion.request, hits
-                )
-                candidate = next(
-                    (
-                        item
-                        for item in completion.candidates
-                        if item.connection_id == target
-                    ),
-                    None,
-                )
-                if not self._lwd_probe_manager.activate(completion, target, candidate):
-                    lwd_logger.warning(
-                        "[edge-probe] stale activation req=%s ignored",
-                        completion.request.request_id,
-                    )
-                continue
             if completion.activation_error is not None:
                 lwd_logger.error(
-                    "[edge-probe] activate failed req=%s target=%s: %s",
+                    "[edge-probe] gateway activation failed req=%s target=%s: %s",
                     completion.request.request_id,
                     completion.connection_id,
                     completion.activation_error,
+                )
+                completion.request.lwd_prefix_nonce = (  # type: ignore[attr-defined]
+                    completion.probe_nonce
                 )
                 self._lwd_abort_internally(completion.request)
                 continue

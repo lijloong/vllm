@@ -10,11 +10,15 @@ from unittest.mock import Mock
 import pytest
 
 from vllm.config.lwd.topology import LwdConnectionId
+from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_client import (
+    LwdGatewayActivation,
+)
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_engine import (
     LwdEdgeEngineCore,
 )
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_probe import (
     LwdEdgeProbeManager,
+    LwdProbeCompletion,
     LwdProbeSubmission,
 )
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_probe_runtime import (
@@ -75,11 +79,18 @@ class _Client:
         self,
         target: LwdConnectionId,
         calls: list[tuple[int, int]],
-        activity: dict[str, int],
+        gateway_target: LwdConnectionId | None = None,
+        advertise_cloud: bool = True,
+        advertise_engine: bool = True,
+        instance_id: str = "cloud-0",
     ) -> None:
         self.target = target
+        self.gateway_target = gateway_target or target
         self.calls = calls
-        self.activity = activity
+        self.advertise_cloud = advertise_cloud
+        self.advertise_engine = advertise_engine
+        self.instance_id = instance_id
+        self.last_drain_task: asyncio.Task[None] | None = None
 
     def build_manifest(
         self, request_id: str, prompt_token_ids: list[int], media_items: tuple
@@ -92,75 +103,202 @@ class _Client:
             tail_hash=None,
         )
 
-    async def probe(
+    async def activate(
         self, _session: object, request_id: str, _prompt: list[int], **kwargs
-    ):
+    ) -> LwdGatewayActivation:
+        assert kwargs["edge_id"] == 0
         self.calls.append((self.target.cloud_id, self.target.dp_idx))
-        self.activity["active"] += 1
-        self.activity["max_active"] = max(
-            self.activity["max_active"], self.activity["active"]
-        )
-        await asyncio.sleep(0.02)
-        self.activity["active"] -= 1
-        hit_blocks = self.target.dp_idx + 1
-        return LwdProbeResult(
+        hit_blocks = self.gateway_target.dp_idx + 1
+        result = LwdProbeResult(
             request_id=request_id,
-            instance_id="cloud-0",
+            instance_id=self.instance_id,
             block_size=4,
             hit_blocks=hit_blocks,
             hit_tokens=hit_blocks * 4,
-            cloud_id=self.target.cloud_id,
-            engine_index=self.target.dp_idx,
+            cloud_id=(self.gateway_target.cloud_id if self.advertise_cloud else None),
+            engine_index=(
+                self.gateway_target.dp_idx if self.advertise_engine else None
+            ),
         )
-
-    async def activate(
-        self, _session: object, _request_id: str, _prompt: list[int], **kwargs
-    ):
-        assert kwargs["edge_id"] == 0
-        assert kwargs["dp_idx"] == self.target.dp_idx
+        self.last_drain_task = asyncio.create_task(asyncio.sleep(60))
+        return LwdGatewayActivation(result, 7, self.last_drain_task)
 
 
-def _drain(manager: LwdEdgeProbeManager, activated: bool = False):
+def _drain(manager: LwdEdgeProbeManager) -> LwdProbeCompletion:
     deadline = time.monotonic() + 2.0
     while time.monotonic() < deadline:
         completions = manager.drain()
         if completions:
-            assert completions[0].activated is activated
             return completions[0]
         time.sleep(0.005)
-    raise AssertionError("probe completion did not arrive")
+    raise AssertionError("gateway activation did not arrive")
 
 
-@pytest.mark.parametrize(
-    ("prefix_enabled", "expected_probes", "expected_concurrency"),
-    [(True, 2, 2), (False, 1, 1)],
-)
-def test_submit_fans_out_only_for_prefix_and_activates_winner(
-    prefix_enabled: bool, expected_probes: int, expected_concurrency: int
+@pytest.mark.parametrize("prefix_enabled", [True, False])
+def test_submit_opens_one_stream_and_binds_gateway_selected_dp(
+    prefix_enabled: bool,
 ) -> None:
     manager = LwdEdgeProbeManager(_config(prefix_enabled), lambda: None)
     calls: list[tuple[int, int]] = []
-    activity = {"active": 0, "max_active": 0}
-    clients = {target: _Client(target, calls, activity) for target in manager._targets}
+    selected = LwdConnectionId(0, 0, 1)
+    clients = {}
+    for target in manager._targets:
+        gateway_target = selected if target.dp_idx == 0 else target
+        clients[target] = _Client(target, calls, gateway_target)
     manager._client = lambda target, _block_size: clients[target]
     try:
         assert manager.submit(_request()) is LwdProbeSubmission.SUBMITTED
         completion = _drain(manager)
-        assert len(calls) == expected_probes
-        assert len(completion.candidates) == expected_probes
-        assert activity["max_active"] == expected_concurrency
+        assert calls == [(0, 0)]
+        assert completion.connection_id == selected
+        assert completion.result is not None
+        assert completion.result.engine_index == 1
+        assert completion.probe_nonce == 7
+        if prefix_enabled:
+            assert completion.chain is not None
+            assert len(completion.chain) == 4
+        else:
+            assert completion.chain is None
 
-        winner = max(
-            completion.candidates,
-            key=lambda candidate: candidate.normalized_hit_tokens(16),
-        )
-        assert manager.activate(completion, winner.connection_id, winner)
-        activated = _drain(manager, activated=True)
-        assert activated.connection_id == winner.connection_id
-        assert activated.result == winner.result
-        assert activated.probe_nonce == completion.probe_nonce
-        manager.mark_admitted("req", activated.probe_nonce)
+        manager.mark_admitted("req", completion.probe_nonce)
         assert not manager._inflight
+    finally:
+        manager.close()
+
+
+def test_stale_activation_does_not_cancel_established_drain() -> None:
+    manager = LwdEdgeProbeManager(_config(True), lambda: None)
+    calls: list[tuple[int, int]] = []
+    target = LwdConnectionId(0, 0, 0)
+    client = _Client(target, calls)
+    manager._client = lambda _target, _block_size: client
+    resolve = manager._resolve_connection
+
+    def abort_and_resolve(result: LwdProbeResult, edge_id: int):
+        manager.abort("req")
+        return resolve(result, edge_id)
+
+    manager._resolve_connection = abort_and_resolve
+    try:
+        assert manager.submit(_request()) is LwdProbeSubmission.SUBMITTED
+        deadline = time.monotonic() + 2
+        while client.last_drain_task is None and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert client.last_drain_task is not None
+        time.sleep(0.05)
+        assert not client.last_drain_task.done()
+        manager._runtime.cancel_task(client.last_drain_task)
+    finally:
+        manager.close()
+
+
+def test_resolve_failure_does_not_cancel_established_drain() -> None:
+    manager = LwdEdgeProbeManager(_config(True), lambda: None)
+    calls: list[tuple[int, int]] = []
+    target = LwdConnectionId(0, 0, 9)
+    client = _Client(target, calls)
+    manager._client = lambda _target, _block_size: client
+    try:
+        assert manager.submit(_request()) is LwdProbeSubmission.SUBMITTED
+        completion = _drain(manager)
+        assert completion.activation_error is not None
+        assert client.last_drain_task is not None
+        assert not client.last_drain_task.done()
+        manager._runtime.cancel_task(client.last_drain_task)
+    finally:
+        manager.close()
+
+
+def test_gateway_instance_id_must_match_cloud() -> None:
+    manager = LwdEdgeProbeManager(_config(True), lambda: None)
+    calls: list[tuple[int, int]] = []
+    target = LwdConnectionId(0, 0, 0)
+    client = _Client(target, calls, instance_id="cloud-1")
+    manager._client = lambda _target, _block_size: client
+    try:
+        assert manager.submit(_request()) is LwdProbeSubmission.SUBMITTED
+        completion = _drain(manager)
+        assert completion.activation_error is not None
+        assert "different instance" in completion.activation_error
+    finally:
+        manager.close()
+
+
+def test_single_cloud_single_dp_infers_omitted_identity() -> None:
+    config = _config(True)
+    config.lwd_config.connections = [_connection(0, 0, 0)]
+    manager = LwdEdgeProbeManager(config, lambda: None)
+    calls: list[tuple[int, int]] = []
+    target = LwdConnectionId(0, 0, 0)
+    manager._client = lambda _target, _block_size: _Client(
+        target, calls, advertise_cloud=False, advertise_engine=False
+    )
+    try:
+        assert manager.submit(_request()) is LwdProbeSubmission.SUBMITTED
+        completion = _drain(manager)
+        assert completion.connection_id == target
+        assert completion.result is not None
+        assert completion.result.cloud_id == 0
+        assert completion.result.engine_index == 0
+        manager.mark_admitted("req", completion.probe_nonce)
+    finally:
+        manager.close()
+
+
+def test_single_cloud_multi_dp_requires_engine_index() -> None:
+    manager = LwdEdgeProbeManager(_config(True), lambda: None)
+    calls: list[tuple[int, int]] = []
+    target = LwdConnectionId(0, 0, 0)
+    manager._client = lambda _target, _block_size: _Client(
+        target, calls, advertise_engine=False
+    )
+    try:
+        assert manager.submit(_request()) is LwdProbeSubmission.SUBMITTED
+        completion = _drain(manager)
+        assert completion.activation_error is not None
+        assert "engine_index" in completion.activation_error
+    finally:
+        manager.close()
+
+
+def test_multi_cloud_requires_cloud_id() -> None:
+    config = _config(True)
+    config.lwd_config.connections = [
+        _connection(0, 0, 0),
+        _connection(0, 1, 0),
+    ]
+    manager = LwdEdgeProbeManager(config, lambda: None)
+    calls: list[tuple[int, int]] = []
+    target = LwdConnectionId(0, 0, 0)
+    manager._client = lambda _target, _block_size: _Client(
+        target, calls, advertise_cloud=False
+    )
+    try:
+        assert manager.submit(_request()) is LwdProbeSubmission.SUBMITTED
+        completion = _drain(manager)
+        assert completion.activation_error is not None
+        assert "cloud_id" in completion.activation_error
+    finally:
+        manager.close()
+
+
+def test_single_cloud_multi_dp_infers_cloud_id() -> None:
+    manager = LwdEdgeProbeManager(_config(True), lambda: None)
+    calls: list[tuple[int, int]] = []
+    selected = LwdConnectionId(0, 0, 1)
+    clients = {}
+    for target in manager._targets:
+        gateway_target = selected if target.dp_idx == 0 else target
+        clients[target] = _Client(target, calls, gateway_target, advertise_cloud=False)
+    manager._client = lambda target, _block_size: clients[target]
+    try:
+        assert manager.submit(_request()) is LwdProbeSubmission.SUBMITTED
+        completion = _drain(manager)
+        assert completion.connection_id == selected
+        assert completion.result is not None
+        assert completion.result.cloud_id == 0
+        assert completion.result.engine_index == 1
+        manager.mark_admitted("req", completion.probe_nonce)
     finally:
         manager.close()
 
@@ -202,9 +340,9 @@ def test_bounded_cancellation_closes_unstarted_coroutine() -> None:
     asyncio.run(run())
 
 
-def test_submit_failure_cleans_inflight_and_falls_back() -> None:
+def test_submit_failure_cleans_inflight_and_fails_closed() -> None:
     class _StoppedRuntime:
-        def submit_group(self, _coroutines):
+        def submit(self, _coroutine, timeout: float):
             raise RuntimeError("event loop stopped")
 
         def stop(self) -> None:
@@ -213,72 +351,43 @@ def test_submit_failure_cleans_inflight_and_falls_back() -> None:
     manager = LwdEdgeProbeManager(_config(True), lambda: None)
     manager._runtime = _StoppedRuntime()
 
-    assert manager.submit(_request()) is LwdProbeSubmission.UNAVAILABLE
+    assert manager.submit(_request()) is LwdProbeSubmission.FAILED
     assert not manager._inflight
     manager.close()
 
 
-def test_resubmission_supersedes_old_batch_and_advances_nonce() -> None:
+def test_abort_does_not_disconnect_established_usage_drain() -> None:
     manager = LwdEdgeProbeManager(_config(True), lambda: None)
     calls: list[tuple[int, int]] = []
-    activity = {"active": 0, "max_active": 0}
-    clients = {target: _Client(target, calls, activity) for target in manager._targets}
+    clients = {target: _Client(target, calls) for target in manager._targets}
     manager._client = lambda target, _block_size: clients[target]
     try:
-        request = _request()
-        assert manager.submit(request) is LwdProbeSubmission.SUBMITTED
-        assert manager.submit(request) is LwdProbeSubmission.SUBMITTED
-        completion = _drain(manager)
-        assert completion.probe_nonce == 2
-        assert len(manager._inflight) == 1
-    finally:
-        manager.close()
-
-
-class _DrainClient(_Client):
-    async def activate(self, *args, **kwargs):
-        return asyncio.create_task(asyncio.sleep(60))
-
-
-def test_abort_cancels_only_unadmitted_usage_drain() -> None:
-    manager = LwdEdgeProbeManager(_config(True), lambda: None)
-    calls: list[tuple[int, int]] = []
-    activity = {"active": 0, "max_active": 0}
-    clients = {
-        target: _DrainClient(target, calls, activity) for target in manager._targets
-    }
-    manager._client = lambda target, _block_size: clients[target]
-
-    def activate_winner():
-        completion = _drain(manager)
-        winner = max(
-            completion.candidates,
-            key=lambda candidate: candidate.normalized_hit_tokens(16),
-        )
-        assert manager.activate(completion, winner.connection_id, winner)
-        return _drain(manager, activated=True)
-
-    try:
-        request = _request()
-        assert manager.submit(request) is LwdProbeSubmission.SUBMITTED
-        activate_winner()
-        first_task = manager._inflight["req"].drain_task
-        manager.abort("req")
-        deadline = time.monotonic() + 1
-        while not first_task.done() and time.monotonic() < deadline:
-            time.sleep(0.005)
-        assert first_task.cancelled()
-
-        assert manager.submit(request) is LwdProbeSubmission.SUBMITTED
-        activated = activate_winner()
-        second_task = manager._inflight["req"].drain_task
-        manager.mark_admitted("req", activated.probe_nonce)
+        assert manager.submit(_request()) is LwdProbeSubmission.SUBMITTED
+        _drain(manager)
+        task = manager._inflight["req"].drain_task
         manager.abort("req")
         time.sleep(0.01)
-        assert not second_task.done()
-        manager._runtime.cancel_task(second_task)
+        assert not task.done()
+        assert not manager._inflight
+        manager._runtime.cancel_task(task)
     finally:
         manager.close()
+
+
+def test_activation_failure_aborts_without_admitting() -> None:
+    request = SimpleNamespace(request_id="r")
+    completion = LwdProbeCompletion(request, activation_error="startup missing")
+    engine = object.__new__(LwdEdgeEngineCore)
+    engine._lwd_probe_manager = Mock()
+    engine._lwd_probe_manager.drain.return_value = [completion]
+    engine._lwd_abort_internally = Mock()
+    engine._lwd_add_request_after_probe = Mock()
+
+    engine._lwd_drain_probe_completions()
+
+    engine._lwd_abort_internally.assert_called_once_with(request)
+    engine._lwd_add_request_after_probe.assert_not_called()
+    assert request.lwd_prefix_nonce == 0
 
 
 def test_admit_marks_usage_drain_only_after_request_notify() -> None:
@@ -290,8 +399,8 @@ def test_admit_marks_usage_drain_only_after_request_notify() -> None:
     engine._lwd_coord_clients = {}
     engine._lwd_notify_request = lambda _dp, _request: calls.append("notify")
     engine._lwd_probe_manager = Mock()
-    engine._lwd_probe_manager.mark_admitted.side_effect = (
-        lambda _rid, _nonce: calls.append("mark")
+    engine._lwd_probe_manager.mark_admitted.side_effect = lambda _rid, _nonce: (
+        calls.append("mark")
     )
 
     engine._lwd_admit_and_notify(request, connection)
@@ -300,7 +409,7 @@ def test_admit_marks_usage_drain_only_after_request_notify() -> None:
     engine._lwd_probe_manager.mark_admitted.assert_called_once_with("r", 7)
 
 
-def test_admit_validation_failure_cancels_unadmitted_usage_drain() -> None:
+def test_admit_validation_failure_releases_unadmitted_activation() -> None:
     request = SimpleNamespace(request_id="r", lwd_prefix_nonce=7)
     engine = object.__new__(LwdEdgeEngineCore)
     engine.scheduler = SimpleNamespace(
@@ -320,7 +429,7 @@ def test_admit_validation_failure_cancels_unadmitted_usage_drain() -> None:
     engine.scheduler.lwd_edge_cancel_admission.assert_called_once_with("r")
 
 
-def test_admit_failure_cancels_unadmitted_usage_drain() -> None:
+def test_admit_failure_releases_unadmitted_activation() -> None:
     connection = LwdConnectionId(0, 0, 0)
     request = SimpleNamespace(request_id="r", lwd_prefix_nonce=7)
     engine = object.__new__(LwdEdgeEngineCore)

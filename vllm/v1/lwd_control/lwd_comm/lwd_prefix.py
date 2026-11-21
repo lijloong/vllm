@@ -42,7 +42,6 @@ HEADER_MM_ABI = "X-Edge-Cloud-MM-ABI"
 HEADER_CLOUD_ID = "X-Edge-Cloud-Cloud-Id"
 HEADER_PROMPT_TOKENS = "X-Edge-Cloud-Prompt-Tokens"
 HEADER_ENGINE_INDEX = "X-Edge-Cloud-Engine-Index"
-HEADER_PROBE_NONCE = "X-Lwd-Probe-Nonce"
 
 _PROBE_RESULT_HEADERS = {
     "request_id": HEADER_REQUEST_ID,
@@ -439,9 +438,9 @@ class LwdProbeResult:
     # Cloud ID in the routing reply: filled by the central scheduler/gateway
     # for multi-cloud routing; None means one cloud or routing disabled.
     cloud_id: int | None = None
-    # Cloud-local DP placement. The new direct-DP protocol always serializes
-    # this field, including zero.
-    engine_index: int = 0
+    # Cloud-local DP placement. Missing is legal only when the edge topology
+    # identifies exactly one DP; ambiguous replies are rejected by the manager.
+    engine_index: int | None = None
 
     def __post_init__(self) -> None:
         if not self.request_id or not self.instance_id:
@@ -452,7 +451,7 @@ class LwdProbeResult:
             raise ValueError("hit_tokens must equal hit_blocks * block_size")
         if self.alignment_tokens < 0:
             raise ValueError("alignment_tokens must not be negative")
-        if self.engine_index < 0:
+        if self.engine_index is not None and self.engine_index < 0:
             raise ValueError("engine_index must not be negative")
 
     def _wire_fields(self) -> dict[str, Any]:
@@ -463,8 +462,9 @@ class LwdProbeResult:
             "hit_blocks": self.hit_blocks,
             "hit_tokens": self.hit_tokens,
             "alignment_tokens": self.alignment_tokens,
-            "engine_index": self.engine_index,
         }
+        if self.engine_index is not None:
+            fields["engine_index"] = self.engine_index
         if self.cloud_id is not None:
             fields["cloud_id"] = self.cloud_id
         return fields
@@ -504,10 +504,12 @@ class LwdProbeResult:
             if type(message.get(name)) is not int:
                 raise ValueError(f"probe {name} must be an integer")
         cloud_id = message.get("cloud_id")
-        if type(cloud_id) is not int or cloud_id < 0:
+        if cloud_id is not None and (type(cloud_id) is not int or cloud_id < 0):
             raise ValueError("probe cloud_id must be a non-negative integer")
         engine_index = message.get("engine_index")
-        if type(engine_index) is not int or engine_index < 0:
+        if engine_index is not None and (
+            type(engine_index) is not int or engine_index < 0
+        ):
             raise ValueError("probe engine_index must be a non-negative integer")
         alignment_tokens = message.get("alignment_tokens", 0)
         if type(alignment_tokens) is not int or alignment_tokens < 0:
@@ -537,6 +539,8 @@ class LwdProbeResult:
             raise ValueError("unsupported edge-cloud protocol")
         try:
             alignment_raw = values.get(HEADER_ALIGNMENT_TOKENS.lower(), "0")
+            cloud_raw = values.get(HEADER_CLOUD_ID.lower())
+            engine_raw = values.get(HEADER_ENGINE_INDEX.lower())
             return cls(
                 request_id=required(HEADER_REQUEST_ID),
                 instance_id=required(HEADER_INSTANCE_ID),
@@ -553,11 +557,15 @@ class LwdProbeResult:
                 alignment_tokens=_parse_ascii_decimal(
                     HEADER_ALIGNMENT_TOKENS, alignment_raw
                 ),
-                cloud_id=_parse_ascii_decimal(
-                    HEADER_CLOUD_ID, required(HEADER_CLOUD_ID)
+                cloud_id=(
+                    None
+                    if cloud_raw is None
+                    else _parse_ascii_decimal(HEADER_CLOUD_ID, cloud_raw)
                 ),
-                engine_index=_parse_ascii_decimal(
-                    HEADER_ENGINE_INDEX, required(HEADER_ENGINE_INDEX)
+                engine_index=(
+                    None
+                    if engine_raw is None
+                    else _parse_ascii_decimal(HEADER_ENGINE_INDEX, engine_raw)
                 ),
             )
         except ValueError as exc:

@@ -21,6 +21,9 @@ from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_engine import (
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_prefix_control import (
     LwdEdgePrefixControl,
 )
+from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_probe import (
+    LwdProbeSubmission,
+)
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_scheduler import (
     LwdEdgeScheduler,
 )
@@ -59,6 +62,9 @@ def _control_engine() -> SimpleNamespace:
         _lwd_admit_and_notify=Mock(),
         _lwd_enqueue_request=Mock(),
         _lwd_abort_internally=Mock(),
+        _lwd_probe_manager=SimpleNamespace(
+            submit=Mock(return_value=LwdProbeSubmission.UNAVAILABLE)
+        ),
         abort_requests=Mock(),
     )
 
@@ -80,10 +86,12 @@ def test_ready_nonce_stale_timeout_and_error_rollback() -> None:
     assert "r" in control.pending
     _request_pending, timer = control.pending["r"]
     timer.cancel()
+    request.lwd_prefix_nonce = 42
     timer.function(*timer.args)
     request_type, timeout = engine.input_queue.get_nowait()
     assert request_type == EngineCoreRequestType.WAKEUP
     assert timeout.error
+    assert timeout.nonce == 42
 
     assert control.handle_client_request(EngineCoreRequestType.WAKEUP, timeout)
     engine.scheduler.lwd_edge_prefix_ready.assert_called_with(request, 0)

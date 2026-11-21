@@ -2,13 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
-"""Edge client for direct DP probes and winner-only usage streams."""
+"""Edge client for the single-request gateway SSE contract."""
 
 from __future__ import annotations
 
 import asyncio
 import json
 from collections.abc import AsyncIterable, AsyncIterator, Sequence
+from dataclasses import dataclass
 from typing import Any
 
 from vllm import envs
@@ -18,11 +19,8 @@ from vllm.v1.lwd_control.lwd_comm.lwd_mm_identity import (
     negotiate_lwd_protocol,
 )
 from vllm.v1.lwd_control.lwd_comm.lwd_prefix import (
-    HEADER_CLOUD_ID,
     HEADER_EDGE_ID,
-    HEADER_ENGINE_INDEX,
     HEADER_MM_ABI,
-    HEADER_PROBE_NONCE,
     HEADER_PROTOCOL,
     PROTOCOL_VERSION,
     PROTOCOL_VERSION_MM,
@@ -34,6 +32,14 @@ from vllm.v1.lwd_control.lwd_comm.lwd_prefix import (
 logger = init_logger(__name__)
 
 _MAX_CONTROL_MESSAGE_CHARS = 16 * 1024
+_MAX_STARTUP_CANDIDATES = 4
+
+
+@dataclass(frozen=True)
+class LwdGatewayActivation:
+    result: LwdProbeResult
+    prefix_nonce: int
+    drain_task: asyncio.Task[None]
 
 
 async def _iter_sse_data(content: AsyncIterable[bytes]) -> AsyncIterator[str]:
@@ -48,6 +54,8 @@ async def _iter_sse_data(content: AsyncIterable[bytes]) -> AsyncIterator[str]:
                 data.clear()
                 size = 0
                 yield payload
+        elif line.startswith(":"):
+            yield line
         elif line == "data" or line.startswith("data:"):
             value = line.partition(":")[2].removeprefix(" ")
             size += len(value) + 1
@@ -61,7 +69,7 @@ async def _iter_sse_data(content: AsyncIterable[bytes]) -> AsyncIterator[str]:
 
 
 class LwdEdgePrefixClient:
-    """Client bound to one cloud DP endpoint, not to a logical edge."""
+    """Client bound to one gateway or direct-DP coordination endpoint."""
 
     def __init__(
         self,
@@ -120,8 +128,7 @@ class LwdEdgePrefixClient:
         manifest: LwdPrefixManifest,
         *,
         edge_id: int,
-        probe_nonce: int,
-        model: str | None = None,
+        model: str,
         multimodal: bool = False,
     ) -> tuple[dict[str, str], dict[str, Any]]:
         headers = manifest.to_headers()
@@ -134,67 +141,18 @@ class LwdEdgePrefixClient:
             headers[HEADER_PROTOCOL] = PROTOCOL_VERSION_MM
             headers[HEADER_MM_ABI] = self._mm_abi_header
         headers[HEADER_EDGE_ID] = str(edge_id)
-        headers[HEADER_PROBE_NONCE] = str(probe_nonce)
-        headers["Accept"] = "application/json"
+        headers["Accept"] = "text/event-stream"
         if self._consumer_id:
             headers["X-Mse-Consumer"] = self._consumer_id
         if self._api_key is not None:
             headers["Authorization"] = f"Bearer {self._api_key}"
         body: dict[str, Any] = {
+            "model": model,
             "messages": manifest.to_messages(),
             "stream": True,
             "stream_options": {"include_usage": True},
         }
-        if model is not None:
-            body["model"] = model
         return headers, body
-
-    async def probe(
-        self,
-        session: Any,
-        request_id: str,
-        prompt_token_ids: list[int],
-        *,
-        edge_id: int,
-        cloud_id: int,
-        dp_idx: int,
-        probe_nonce: int,
-        manifest: LwdPrefixManifest | None = None,
-        media_items: Sequence[Any] = (),
-        model: str | None = None,
-    ) -> LwdProbeResult:
-        """Run one short, read-only probe against this client's DP."""
-        if manifest is None:
-            manifest = self.build_manifest(request_id, prompt_token_ids, media_items)
-        multimodal = bool(media_items)
-        headers, body = self.build_control_request(
-            manifest,
-            edge_id=edge_id,
-            probe_nonce=probe_nonce,
-            model=model,
-            multimodal=multimodal,
-        )
-        headers[HEADER_CLOUD_ID] = str(cloud_id)
-        headers[HEADER_ENGINE_INDEX] = str(dp_idx)
-        response = await self._post("/v1/lwd/probe", session, headers, body)
-        try:
-            if response.status != 200:
-                detail = await self._read_error_body(response)
-                raise RuntimeError(
-                    f"prefix probe HTTP {response.status} "
-                    f"url={self._control_url} body={detail}"
-                )
-            message = await asyncio.wait_for(response.json(), self._probe_timeout)
-            probe = self._parse_probe(message, request_id, prompt_token_ids, multimodal)
-            if probe.cloud_id != cloud_id or probe.engine_index != dp_idx:
-                raise RuntimeError(
-                    "cloud returned a different DP: "
-                    f"expected=({cloud_id}, {dp_idx}) "
-                    f"actual=({probe.cloud_id}, {probe.engine_index})"
-                )
-            return probe
-        finally:
-            response.close()
 
     async def activate(
         self,
@@ -203,38 +161,93 @@ class LwdEdgePrefixClient:
         prompt_token_ids: list[int],
         *,
         edge_id: int,
-        cloud_id: int,
-        dp_idx: int,
-        probe_nonce: int,
+        model: str,
         manifest: LwdPrefixManifest | None = None,
         media_items: Sequence[Any] = (),
-        model: str | None = None,
-    ) -> asyncio.Task[None]:
-        """Register usage before RequestNotify, then drain the winner stream."""
+    ) -> LwdGatewayActivation:
+        """Wait for the startup content, then drain usage in the background."""
         if manifest is None:
             manifest = self.build_manifest(request_id, prompt_token_ids, media_items)
         multimodal = bool(media_items)
         headers, body = self.build_control_request(
             manifest,
             edge_id=edge_id,
-            probe_nonce=probe_nonce,
             model=model,
             multimodal=multimodal,
         )
-        headers["Accept"] = "text/event-stream"
-        headers[HEADER_CLOUD_ID] = str(cloud_id)
-        headers[HEADER_ENGINE_INDEX] = str(dp_idx)
-        response = await self._post("/v1/lwd/activate", session, headers, body)
+        response = await self._post("/v1/chat/completions", session, headers, body)
         if response.status != 200:
             try:
                 detail = await self._read_error_body(response)
                 raise RuntimeError(
-                    f"prefix activate HTTP {response.status} "
+                    f"gateway activation HTTP {response.status} "
                     f"url={self._control_url} body={detail}"
                 )
             finally:
                 response.close()
-        return self._start_drain(request_id, response, _iter_sse_data(response.content))
+
+        sse_data = _iter_sse_data(response.content)
+        try:
+            probe, prefix_nonce = await asyncio.wait_for(
+                self._read_startup(sse_data, request_id, prompt_token_ids, multimodal),
+                self._probe_timeout,
+            )
+        except BaseException:
+            response.close()
+            raise
+        drain_task = self._start_drain(request_id, response, sse_data)
+        return LwdGatewayActivation(probe, prefix_nonce, drain_task)
+
+    async def _read_startup(
+        self,
+        sse_data: AsyncIterator[str],
+        request_id: str,
+        prompt_token_ids: list[int],
+        multimodal: bool,
+    ) -> tuple[LwdProbeResult, int]:
+        candidates: list[str] = []
+        async for payload in sse_data:
+            if payload == "[DONE]":
+                raise RuntimeError("gateway stream ended before the startup message")
+            try:
+                chunk = json.loads(payload)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(chunk, dict):
+                continue
+            choices = chunk.get("choices") or []
+            if not choices:
+                continue
+            content = (choices[0].get("delta") or {}).get("content")
+            if not content:
+                continue
+            if content.lstrip().startswith("{"):
+                candidates = [candidate + content for candidate in candidates]
+                candidates.append(content)
+                if len(candidates) > _MAX_STARTUP_CANDIDATES:
+                    candidates.pop(0)
+            elif candidates:
+                candidates = [candidate + content for candidate in candidates]
+            else:
+                continue
+            for candidate in list(candidates):
+                if len(candidate) > _MAX_CONTROL_MESSAGE_CHARS:
+                    raise RuntimeError("gateway startup message exceeds the size limit")
+                try:
+                    message = json.loads(candidate)
+                except json.JSONDecodeError:
+                    continue
+                candidates.remove(candidate)
+                if not isinstance(message, dict) or "request_id" not in message:
+                    continue
+                probe = self._parse_probe(
+                    message, request_id, prompt_token_ids, multimodal
+                )
+                prefix_nonce = message.get("prefix_nonce")
+                if type(prefix_nonce) is not int or prefix_nonce <= 0:
+                    raise RuntimeError("cloud returned an invalid prefix nonce")
+                return probe, prefix_nonce
+        raise RuntimeError("gateway stream ended before the startup message")
 
     async def _post(
         self, path: str, session: Any, headers: dict[str, str], body: dict[str, Any]
@@ -295,17 +308,33 @@ class LwdEdgePrefixClient:
     ) -> asyncio.Task[None]:
         task = asyncio.create_task(self._drain_stream(request_id, response, sse_data))
         self._drain_tasks.add(task)
-        task.add_done_callback(self._drain_tasks.discard)
+
+        def finish(_task: asyncio.Task[None]) -> None:
+            self._drain_tasks.discard(_task)
+            try:
+                response.close()
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "[LWD][edge-client] gateway stream close failed req=%s",
+                    request_id,
+                    exc_info=True,
+                )
+
+        task.add_done_callback(finish)
         return task
 
     async def _drain_stream(
         self, request_id: str, response: Any, sse_data: AsyncIterator[str]
     ) -> None:
         usage: dict | None = None
+        unavailable = False
         try:
             async for payload in sse_data:
                 if payload == "[DONE]":
                     break
+                if payload == ": edge-cloud-usage-unavailable":
+                    unavailable = True
+                    continue
                 try:
                     chunk = json.loads(payload)
                 except json.JSONDecodeError:
@@ -313,10 +342,16 @@ class LwdEdgePrefixClient:
                 if chunk.get("usage") is not None:
                     usage = chunk["usage"]
             if usage is None:
-                logger.warning(
-                    "[LWD][edge-client] usage missing in probe stream req=%s",
-                    request_id,
-                )
+                if unavailable:
+                    logger.info(
+                        "[LWD][edge-client] usage unavailable in gateway stream req=%s",
+                        request_id,
+                    )
+                else:
+                    logger.warning(
+                        "[LWD][edge-client] usage missing in gateway stream req=%s",
+                        request_id,
+                    )
                 return
             details = usage.get("prompt_tokens_details") or {}
             logger.info(
@@ -332,7 +367,7 @@ class LwdEdgePrefixClient:
             raise
         except Exception:  # noqa: BLE001
             logger.warning(
-                "[LWD][edge-client] probe stream drain failed req=%s",
+                "[LWD][edge-client] gateway stream drain failed req=%s",
                 request_id,
                 exc_info=True,
             )
@@ -341,7 +376,7 @@ class LwdEdgePrefixClient:
                 response.close()
             except Exception:  # noqa: BLE001
                 logger.debug(
-                    "[LWD][edge-client] probe stream close failed req=%s",
+                    "[LWD][edge-client] gateway stream close failed req=%s",
                     request_id,
                     exc_info=True,
                 )

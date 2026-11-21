@@ -5,9 +5,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import queue
+import socket
 import time
 from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import Mock
@@ -15,6 +18,7 @@ from unittest.mock import Mock
 import httpx
 import pytest
 import pytest_asyncio
+import uvicorn
 
 from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_control import (
     LwdCloudControlBridge,
@@ -23,10 +27,8 @@ from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_control import (
     start_lwd_cloud_control_server,
 )
 from vllm.v1.lwd_control.lwd_comm.lwd_prefix import (
-    HEADER_CLOUD_ID,
     HEADER_EDGE_ID,
     HEADER_ENGINE_INDEX,
-    HEADER_PROBE_NONCE,
     LwdPrefixManifest,
     LwdProbeResult,
     LwdUsage,
@@ -38,6 +40,29 @@ BridgeFactory = Callable[
 ]
 
 
+@asynccontextmanager
+async def _live_server(app: Any) -> AsyncIterator[str]:
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen()
+    port = listener.getsockname()[1]
+    server = uvicorn.Server(uvicorn.Config(app, log_level="warning"))
+    serve_task = asyncio.create_task(server.serve(sockets=[listener]))
+    try:
+        deadline = time.monotonic() + 5
+        while not server.started:
+            if serve_task.done():
+                await serve_task
+            if time.monotonic() >= deadline:
+                raise TimeoutError("test HTTP server did not start")
+            await asyncio.sleep(0.01)
+        yield f"http://127.0.0.1:{port}"
+    finally:
+        server.should_exit = True
+        await serve_task
+        listener.close()
+
+
 @pytest_asyncio.fixture
 async def bridge_factory() -> AsyncIterator[BridgeFactory]:
     bridges: list[LwdCloudControlBridge] = []
@@ -45,7 +70,9 @@ async def bridge_factory() -> AsyncIterator[BridgeFactory]:
     def make_bridge(
         engine_count: int,
     ) -> tuple[LwdCloudControlBridge, list[queue.Queue[Any]], queue.Queue[Any]]:
-        command_queues = [queue.Queue() for _ in range(engine_count)]
+        command_queues: list[queue.Queue[Any]] = [
+            queue.Queue() for _ in range(engine_count)
+        ]
         event_queue: queue.Queue[Any] = queue.Queue()
         bridge = LwdCloudControlBridge(command_queues, event_queue)
         bridge.start()
@@ -66,6 +93,24 @@ def _manifest(request_id: str) -> LwdPrefixManifest:
         prompt_tokens=16,
         block_size=16,
         full_block_hashes=(bytes(range(32)),),
+    )
+
+
+def test_tail_digest_is_accepted_as_final_message() -> None:
+    manifest = LwdPrefixManifest(
+        request_id="tail",
+        prompt_tokens=18,
+        block_size=16,
+        full_block_hashes=(bytes(range(32)),),
+        tail_hash=bytes(range(31, -1, -1)),
+    )
+    messages = manifest.to_messages()
+    assert messages[0]["content"].startswith("ecb1:")
+    assert messages[1]["content"].startswith("ect1:")
+    headers = manifest.to_headers()
+    assert (
+        LwdPrefixManifest.from_openai_request(headers, {"messages": messages})
+        == manifest
     )
 
 
@@ -113,7 +158,6 @@ async def _start_probe(
     await asyncio.sleep(0)
     command = command_queue.get_nowait()
     assert command["type"] == "probe"
-    assert command["reserve"] is False
     assert command["engine_index"] == dp_idx
     assert command["reply_key"] == key
     assert command["deadline"] == command["t_cmd"] + timeout
@@ -206,7 +250,7 @@ async def test_activate_owns_usage_and_old_release_preserves_new_generation(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("old_dp", "old_nonce"), [(0, 8), (1, 7)])
+@pytest.mark.parametrize(("old_dp", "old_nonce"), [(1, 7)])
 async def test_usage_rejects_mismatched_generation(
     bridge_factory: BridgeFactory, old_dp: int, old_nonce: int
 ) -> None:
@@ -246,20 +290,43 @@ async def test_usage_rejects_mismatched_generation(
 
 
 @pytest.mark.asyncio
-async def test_usage_admission_timeout_releases_registration(
+async def test_usage_from_wrong_dp_is_rejected_immediately(
+    bridge_factory: BridgeFactory,
+) -> None:
+    bridge, _, event_queue = bridge_factory(1)
+    registration = bridge.activate("wrong-dp", 1, 8)
+    wrong_usage = LwdUsage(prompt_tokens=16, completion_tokens=4, cached_tokens=8)
+    waiter = asyncio.create_task(
+        bridge.wait_usage("wrong-dp", timeout=1, registration=registration)
+    )
+    event_queue.put(
+        _usage_event("wrong-dp", wrong_usage, engine_index=0, prefix_nonce=8)
+    )
+
+    assert await waiter is None
+    assert bridge.registration("wrong-dp") is None
+
+
+@pytest.mark.asyncio
+async def test_request_notify_timeout_releases_registration(
     bridge_factory: BridgeFactory,
 ) -> None:
     bridge, _, _ = bridge_factory(1)
     registration = bridge.activate("admission", 0, 7)
     assert (
-        await bridge.wait_usage("admission", timeout=0.01, registration=registration)
+        await bridge.wait_usage(
+            "admission",
+            timeout=1,
+            request_notify_timeout=0.01,
+            registration=registration,
+        )
         is None
     )
     assert bridge.registration("admission") is None
 
 
 @pytest.mark.asyncio
-async def test_started_usage_wait_has_no_total_timeout(
+async def test_started_usage_wait_still_has_total_timeout(
     bridge_factory: BridgeFactory,
 ) -> None:
     bridge, _, event_queue = bridge_factory(1)
@@ -271,9 +338,8 @@ async def test_started_usage_wait_has_no_total_timeout(
         bridge.wait_usage("long", timeout=0.01, registration=registration)
     )
     await asyncio.sleep(0.02)
-    assert not waiter.done()
-    event_queue.put(_usage_event("long", expected))
-    assert await waiter is expected
+    assert await waiter is None
+    assert bridge.registration("long") is None
 
 
 @pytest.mark.asyncio
@@ -301,7 +367,6 @@ def test_processor_always_peeks_and_echoes_dp_reply_key() -> None:
         {
             "type": "probe",
             "manifest": manifest,
-            "reserve": True,
             "reply_key": "r#nonce:7:0:1",
             "engine_index": 1,
         }
@@ -397,7 +462,7 @@ def test_processor_custom_poll_budget_preserves_remaining_commands() -> None:
     assert event_queue.qsize() == 3
 
 
-def test_probe_result_requires_and_serializes_explicit_dp_identity() -> None:
+def test_probe_result_supports_scenario_based_dp_identity() -> None:
     result = _result("r", 1, 0)
     headers = result.to_headers()
     message = result.to_control_message()
@@ -407,124 +472,223 @@ def test_probe_result_requires_and_serializes_explicit_dp_identity() -> None:
     assert LwdProbeResult.from_headers(headers) == result
     assert LwdProbeResult.from_control_message(message) == result
 
-    missing_engine = {
-        key: value for key, value in message.items() if key != "engine_index"
+    minimal = {
+        "type": "edge_cloud_probe",
+        "protocol": "edge-cloud-prefix-v1",
+        "request_id": "r",
+        "instance_id": "cloud-test",
+        "block_size": 16,
+        "hit_blocks": 1,
+        "hit_tokens": 16,
     }
-    with pytest.raises(ValueError, match="engine_index"):
-        LwdProbeResult.from_control_message(missing_engine)
-    missing_cloud = {
-        key: value for key, value in headers.items() if key != HEADER_CLOUD_ID
-    }
-    with pytest.raises(ValueError, match="invalid integers"):
-        LwdProbeResult.from_headers(missing_cloud)
+    inferred = LwdProbeResult.from_control_message(minimal)
+    assert inferred.cloud_id is None
+    assert inferred.engine_index is None
+    assert inferred.alignment_tokens == 0
+    assert LwdProbeResult.from_headers(inferred.to_headers()) == inferred
 
 
 def _http_request(request_id: str = "r") -> tuple[dict[str, str], dict[str, Any]]:
     manifest = _manifest(request_id)
-    headers = {
-        **manifest.to_headers(),
-        HEADER_EDGE_ID: "2",
-        HEADER_PROBE_NONCE: "7",
-        HEADER_CLOUD_ID: "0",
-        HEADER_ENGINE_INDEX: "0",
+    headers = {**manifest.to_headers(), HEADER_EDGE_ID: "2"}
+    body = {
+        "model": "test-model",
+        "messages": manifest.to_messages(),
+        "stream": True,
+        "stream_options": {"include_usage": True},
     }
-    return headers, {"model": "test-model", "messages": manifest.to_messages()}
+    return headers, body
+
+
+async def _answer_next_probe(
+    command_queue: queue.Queue[Any], event_queue: queue.Queue[Any]
+) -> None:
+    while command_queue.empty():
+        await asyncio.sleep(0)
+    command = command_queue.get_nowait()
+    event_queue.put(
+        {
+            "type": "probe",
+            "request_id": command["reply_key"],
+            "engine_index": command["engine_index"],
+            "ok": True,
+            "result": _result("e2-r", 1, command["engine_index"]),
+        }
+    )
 
 
 @pytest.mark.asyncio
-async def test_probe_http_returns_control_json_and_forces_dp_identity(
-    bridge_factory: BridgeFactory,
+async def test_contract_streams_startup_heartbeat_and_real_usage(
+    bridge_factory: BridgeFactory, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setattr(
+        "vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_control."
+        "_USAGE_HEARTBEAT_INTERVAL",
+        0.01,
+    )
     bridge, command_queues, event_queue = bridge_factory(2)
     app = create_lwd_cloud_control_app(bridge, cloud_id=0, dp_idx=1)
-    transport = httpx.ASGITransport(app=app)
-    headers, body = _http_request()
-    headers[HEADER_CLOUD_ID] = "0"
-    headers[HEADER_ENGINE_INDEX] = "1"
-    async with httpx.AsyncClient(
-        transport=transport, base_url="http://cloud"
-    ) as client:
-        response_task = asyncio.create_task(
-            client.post("/v1/lwd/probe", headers=headers, json=body)
-        )
-        while command_queues[1].empty():
-            await asyncio.sleep(0)
-        command = command_queues[1].get_nowait()
-        assert command_queues[0].empty()
-        event_queue.put(
-            {
-                "type": "probe",
-                "request_id": command["reply_key"],
-                "engine_index": 1,
-                "ok": True,
-                "result": _result("e2-r", 1, 0),
-            }
-        )
-        response = await response_task
-
-    assert response.status_code == 200
-    assert response.json()["type"] == "edge_cloud_probe"
-    assert response.json()["request_id"] == "r"
-    assert response.json()["cloud_id"] == 0
-    assert response.json()["engine_index"] == 1
-    assert bridge.registration("e2-r") is None
-
-
-@pytest.mark.asyncio
-async def test_activate_registers_before_headers_then_streams_real_usage(
-    bridge_factory: BridgeFactory,
-) -> None:
-    bridge, _, event_queue = bridge_factory(1)
-    app = create_lwd_cloud_control_app(bridge, cloud_id=0, dp_idx=0)
-    transport = httpx.ASGITransport(app=app)
     headers, body = _http_request()
     expected = LwdUsage(prompt_tokens=16, completion_tokens=3, cached_tokens=16)
-    registered: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
+    responder = asyncio.create_task(_answer_next_probe(command_queues[1], event_queue))
 
-    async def publish_usage() -> None:
-        while (registration := bridge.registration("e2-r")) is None:
-            await asyncio.sleep(0)
-        registered.set_result(registration)
-        event_queue.put(_usage_event("e2-r", expected, kind="usage_start"))
-        event_queue.put(_usage_event("e2-r", expected))
-
-    publisher = asyncio.create_task(publish_usage())
     async with (
-        httpx.AsyncClient(transport=transport, base_url="http://cloud") as client,
+        _live_server(app) as base_url,
+        httpx.AsyncClient(base_url=base_url) as client,
         client.stream(
-            "POST", "/v1/lwd/activate", headers=headers, json=body
+            "POST", "/v1/chat/completions", headers=headers, json=body
         ) as response,
     ):
         assert response.status_code == 200
-        frames = [frame async for frame in response.aiter_text()]
+        frames = response.aiter_text()
+        startup_frame = await anext(frames)
+        empty_frame = await anext(frames)
+        startup = json.loads(startup_frame.removeprefix("data: "))
+        empty = json.loads(empty_frame.removeprefix("data: "))
+        delta = startup["choices"][0]["delta"]
+        assert delta["role"] == "assistant"
+        assert isinstance(delta["content"], str)
+        control = json.loads(delta["content"])
+        assert control["type"] == "edge_cloud_probe"
+        assert control["request_id"] == "r"
+        assert control["cloud_id"] == 0
+        assert control["engine_index"] == 1
+        assert empty["choices"][0] == {
+            "index": 0,
+            "delta": {},
+            "finish_reason": None,
+        }
+        assert "usage" not in startup and "usage" not in empty
+        assert response.headers["x-edge-cloud-instance-id"] == "cloud-test"
+        assert response.headers["x-edge-cloud-prefix-hit-tokens"] == "16"
+        assert response.headers["x-accel-buffering"] == "no"
 
-    await publisher
-    assert await registered is not None
-    assert response.headers[HEADER_ENGINE_INDEX] == "0"
-    assert any('"completion_tokens":3' in frame for frame in frames)
-    assert "".join(frames).endswith("data: [DONE]\n\n")
+        assert await anext(frames) == ": edge-cloud-usage-pending\n\n"
+        registration = bridge.registration("e2-r")
+        assert registration is not None
+        assert registration.engine_index == control["engine_index"]
+        assert control["prefix_nonce"] == registration.prefix_nonce
+        event_queue.put(
+            _usage_event(
+                "e2-r",
+                expected,
+                engine_index=registration.engine_index,
+                prefix_nonce=registration.prefix_nonce,
+                kind="usage_start",
+            )
+        )
+        event_queue.put(
+            _usage_event(
+                "e2-r",
+                expected,
+                engine_index=registration.engine_index,
+                prefix_nonce=registration.prefix_nonce,
+            )
+        )
+        remaining = [frame async for frame in frames]
+
+    await responder
+    usage_chunk = json.loads(remaining[0].removeprefix("data: "))
+    assert usage_chunk["choices"] == []
+    assert '"completion_tokens":3' in remaining[0]
+    assert '"cached_tokens":16' in remaining[0]
+    assert remaining == [remaining[0], "data: [DONE]\n\n"]
     assert bridge.registration("e2-r") is None
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("nonce", [None, "-1", "1.5"])
-async def test_http_endpoints_require_valid_probe_nonce(
-    bridge_factory: BridgeFactory, nonce: str | None
+async def test_bridge_close_after_startup_ends_usage_unavailable(
+    bridge_factory: BridgeFactory,
+) -> None:
+    bridge, command_queues, event_queue = bridge_factory(1)
+    app = create_lwd_cloud_control_app(bridge, cloud_id=0, dp_idx=0)
+    headers, body = _http_request()
+    responder = asyncio.create_task(_answer_next_probe(command_queues[0], event_queue))
+
+    async with (
+        _live_server(app) as base_url,
+        httpx.AsyncClient(base_url=base_url) as client,
+        client.stream(
+            "POST", "/v1/chat/completions", headers=headers, json=body
+        ) as response,
+    ):
+        frames = response.aiter_text()
+        await anext(frames)
+        await anext(frames)
+        bridge.close()
+        remaining = [frame async for frame in frames]
+
+    await responder
+    assert remaining[-2:] == [
+        ": edge-cloud-usage-unavailable\n\n",
+        "data: [DONE]\n\n",
+    ]
+    assert all('"usage"' not in frame for frame in remaining)
+
+
+@pytest.mark.asyncio
+async def test_contract_usage_unavailable_never_emits_zero_usage(
+    bridge_factory: BridgeFactory,
+) -> None:
+    bridge, command_queues, event_queue = bridge_factory(1)
+    app = create_lwd_cloud_control_app(bridge, cloud_id=0, dp_idx=0)
+    headers, body = _http_request()
+
+    async def no_usage(*args: Any, **kwargs: Any) -> None:
+        return None
+
+    bridge.wait_usage = no_usage
+    responder = asyncio.create_task(_answer_next_probe(command_queues[0], event_queue))
+    async with (
+        _live_server(app) as base_url,
+        httpx.AsyncClient(base_url=base_url) as client,
+        client.stream(
+            "POST", "/v1/chat/completions", headers=headers, json=body
+        ) as response,
+    ):
+        frames = [frame async for frame in response.aiter_text()]
+
+    await responder
+    assert frames[-2:] == [
+        ": edge-cloud-usage-unavailable\n\n",
+        "data: [DONE]\n\n",
+    ]
+    assert all('"usage"' not in frame for frame in frames)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("field", "value"), [("stream", False), ("max_tokens", 1)])
+async def test_contract_rejects_non_whitelisted_body(
+    bridge_factory: BridgeFactory, field: str, value: Any
 ) -> None:
     bridge, command_queues, _ = bridge_factory(1)
     app = create_lwd_cloud_control_app(bridge, cloud_id=0, dp_idx=0)
     transport = httpx.ASGITransport(app=app)
     headers, body = _http_request()
-    if nonce is None:
-        headers.pop(HEADER_PROBE_NONCE)
-    else:
-        headers[HEADER_PROBE_NONCE] = nonce
+    body[field] = value
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://cloud"
+    ) as client:
+        response = await client.post("/v1/chat/completions", headers=headers, json=body)
+    assert response.status_code == 400
+    assert command_queues[0].empty()
+    assert bridge.registration("e2-r") is None
+
+
+@pytest.mark.asyncio
+async def test_legacy_probe_and_activate_routes_are_removed(
+    bridge_factory: BridgeFactory,
+) -> None:
+    bridge, command_queues, _ = bridge_factory(1)
+    app = create_lwd_cloud_control_app(bridge, cloud_id=0, dp_idx=0)
+    transport = httpx.ASGITransport(app=app)
+    headers, body = _http_request()
     async with httpx.AsyncClient(
         transport=transport, base_url="http://cloud"
     ) as client:
         for path in ("/v1/lwd/probe", "/v1/lwd/activate"):
             response = await client.post(path, headers=headers, json=body)
-            assert response.status_code == 400
+            assert response.status_code == 404
     assert command_queues[0].empty()
     assert bridge.registration("e2-r") is None
 

@@ -2,11 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
-"""Cloud-side direct-DP HTTP coordination.
+"""Cloud-side OpenAI-compatible gateway coordination.
 
 One bridge owns all per-DP command queues and the shared event queue. Each DP
-has a thin FastAPI listener: ``/v1/lwd/probe`` performs a short read-only peek,
-while ``/v1/lwd/activate`` registers usage before returning its SSE response.
+has a thin FastAPI listener. One ``/v1/chat/completions`` request performs a
+read-only prefix peek, registers usage and returns the startup message and
+final usage on the same SSE response.
 """
 
 from __future__ import annotations
@@ -35,13 +36,9 @@ from vllm.v1.lwd_control.lwd_comm.lwd_mm_identity import (
     negotiate_lwd_protocol,
 )
 from vllm.v1.lwd_control.lwd_comm.lwd_prefix import (
-    HEADER_CLOUD_ID,
     HEADER_EDGE_ID,
-    HEADER_ENGINE_INDEX,
     HEADER_MM_ABI,
-    HEADER_PROBE_NONCE,
     HEADER_PROTOCOL,
-    HEADER_REQUEST_ID,
     PROBE_HEADROOM_S,
     PROTOCOL_VERSION,
     PROTOCOL_VERSION_MM,
@@ -53,7 +50,8 @@ from vllm.v1.lwd_control.lwd_comm.lwd_prefix import (
 logger = init_logger(__name__)
 
 _USAGE_HEARTBEAT_INTERVAL = 10.0
-_USAGE_ADMISSION_TIMEOUT_S = 600.0
+_USAGE_WAIT_TIMEOUT_S = 600.0
+_REQUEST_NOTIFY_TIMEOUT_S = 30.0
 _CLOUD_PROBE_POLL_BUDGET = 32
 _SERVER_START_TIMEOUT = 30.0
 _SERVER_STOP_TIMEOUT = 5.0
@@ -68,7 +66,7 @@ class _LwdUsageRegistration:
 
 
 class LwdCloudControlBridge:
-    """Dispatch direct-DP probe and winner usage events to asyncio futures."""
+    """Dispatch direct-DP probe and activated usage events to asyncio futures."""
 
     def __init__(self, command_queue: Any, event_queue: Any) -> None:
         if isinstance(command_queue, (list, tuple)):
@@ -80,6 +78,7 @@ class LwdCloudControlBridge:
         self._event_queue = event_queue
         self._probe_futures: dict[str, tuple[int, asyncio.Future[LwdProbeResult]]] = {}
         self._usage_futures: dict[str, _LwdUsageRegistration] = {}
+        self._prefix_nonce = 0
         self._loop: asyncio.AbstractEventLoop | None = None
         self._lock = threading.Lock()
         self._closed = False
@@ -165,7 +164,7 @@ class LwdCloudControlBridge:
             raise
 
     def activate(
-        self, request_id: str, dp_idx: int, prefix_nonce: int
+        self, request_id: str, dp_idx: int, prefix_nonce: int | None = None
     ) -> _LwdUsageRegistration:
         """Register one DP/nonce usage generation before response headers."""
         loop = asyncio.get_running_loop()
@@ -173,6 +172,9 @@ class LwdCloudControlBridge:
             if self._closed:
                 raise RuntimeError("cloud control plane stopped")
             self._loop = loop
+            if prefix_nonce is None:
+                self._prefix_nonce += 1
+                prefix_nonce = self._prefix_nonce
             stale = self._usage_futures.pop(request_id, None)
             registration = _LwdUsageRegistration(
                 engine_index=dp_idx,
@@ -195,11 +197,12 @@ class LwdCloudControlBridge:
     async def wait_usage(
         self,
         request_id: str,
-        timeout: float = _USAGE_ADMISSION_TIMEOUT_S,
+        timeout: float = _USAGE_WAIT_TIMEOUT_S,
         *,
+        request_notify_timeout: float = _REQUEST_NOTIFY_TIMEOUT_S,
         registration: _LwdUsageRegistration | None = None,
     ) -> LwdUsage | None:
-        """Bound only admission; started requests wait for real terminal usage."""
+        """Bound RequestNotify admission and the total real-usage wait."""
         with self._lock:
             current = self._usage_futures.get(request_id)
         if current is None or (
@@ -211,19 +214,29 @@ class LwdCloudControlBridge:
                 )
             return None
         registration = current
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
         started_wait = asyncio.create_task(registration.started.wait())
+        waiters: set[asyncio.Future[Any]] = {registration.future, started_wait}
         try:
-            done, _ = await asyncio.wait(
-                {registration.future, started_wait},
-                timeout=timeout,
+            completed, _ = await asyncio.wait(
+                waiters,
+                timeout=min(request_notify_timeout, timeout),
                 return_when=asyncio.FIRST_COMPLETED,
             )
-            if registration.future in done:
+            if registration.future in completed:
                 return registration.future.result()
-            if started_wait in done:
-                return await registration.future
-            logger.warning("[LWD][ctrl] usage admission timeout req=%s", request_id)
-            return None
+            if started_wait not in completed:
+                logger.warning(
+                    "[LWD][ctrl] RequestNotify wait timeout req=%s", request_id
+                )
+                return None
+            remaining = max(0.0, deadline - loop.time())
+            try:
+                return await asyncio.wait_for(registration.future, remaining)
+            except TimeoutError:
+                logger.warning("[LWD][ctrl] usage wait timeout req=%s", request_id)
+                return None
         finally:
             started_wait.cancel()
             with self._lock:
@@ -280,39 +293,59 @@ class LwdCloudControlBridge:
         """Settle futures only on the event-loop thread."""
         kind = event.get("type")
         request_id = event.get("request_id")
+        if not isinstance(request_id, str):
+            logger.warning("[LWD][ctrl] event without request id ignored")
+            return
         if kind == "probe":
             with self._lock:
                 registered = self._probe_futures.get(request_id)
                 if registered is None or registered[0] != event.get("engine_index"):
                     return
                 self._probe_futures.pop(request_id, None)
-                future = registered[1]
-            if future.done():
+                probe_future = registered[1]
+            if probe_future.done():
                 return
             if event.get("ok"):
-                future.set_result(event.get("result"))
+                result = event.get("result")
+                if not isinstance(result, LwdProbeResult):
+                    probe_future.set_exception(
+                        RuntimeError("probe event returned an invalid result")
+                    )
+                    return
+                probe_future.set_result(result)
             else:
-                future.set_exception(RuntimeError(event.get("error") or "probe failed"))
+                probe_future.set_exception(
+                    RuntimeError(event.get("error") or "probe failed")
+                )
             return
         if kind in ("usage_start", "usage"):
             with self._lock:
                 registration = self._usage_futures.get(request_id)
-            if (
-                registration is None
-                or registration.engine_index != event.get("engine_index")
-                or registration.prefix_nonce != event.get("prefix_nonce")
-            ):
+            if registration is None:
+                return
+            if registration.prefix_nonce != event.get("prefix_nonce"):
+                return
+            if registration.engine_index != event.get("engine_index"):
+                logger.error(
+                    "[LWD][ctrl] reject usage from wrong DP req=%s "
+                    "expected=%d actual=%s",
+                    request_id,
+                    registration.engine_index,
+                    event.get("engine_index"),
+                )
+                if not registration.future.done():
+                    registration.future.set_result(None)
                 return
             if kind == "usage_start":
                 registration.started.set()
                 return
-            future = registration.future
-            if future.done():
+            usage_future = registration.future
+            if usage_future.done():
                 logger.warning(
                     "[LWD][ctrl] usage event arrived too late req=%s", request_id
                 )
                 return
-            future.set_result(event.get("usage"))
+            usage_future.set_result(event.get("usage"))
 
 
 class LwdCloudControlProcessor:
@@ -402,15 +435,22 @@ def _sse_data(obj: Any) -> str:
     return f"data: {json.dumps(obj, separators=(',', ':'))}\n\n"
 
 
-def _build_chunk(request_id: str, model: str, usage: dict[str, Any]) -> dict[str, Any]:
-    return {
+def _build_chunk(
+    request_id: str,
+    model: str,
+    choices: list[Any],
+    usage: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    chunk: dict[str, Any] = {
         "id": request_id,
         "object": "chat.completion.chunk",
         "created": int(time.time()),
         "model": model,
-        "choices": [],
-        "usage": usage,
+        "choices": choices,
     }
+    if usage is not None:
+        chunk["usage"] = usage
+    return chunk
 
 
 def _required_decimal_header(headers: Mapping[str, str], name: str) -> int:
@@ -429,9 +469,9 @@ def create_lwd_cloud_control_app(
     processor_fingerprint: bytes | None = None,
     *,
     enforce_mm_abi_match: bool = True,
-    probe_timeout: float = 25.0,
+    probe_timeout: float = 20.0,
 ) -> Any:
-    """Build one fixed-DP app with short probe and activate/usage routes."""
+    """Build one fixed-DP app implementing the gateway SSE contract."""
     if cloud_id < 0 or dp_idx < 0:
         raise ValueError("cloud_id and dp_idx must be non-negative")
     app = FastAPI()
@@ -443,11 +483,27 @@ def create_lwd_cloud_control_app(
 
     async def parse_request(
         request: Request,
-    ) -> tuple[LwdPrefixManifest, Mapping[str, Any], str, str | None, int]:
+    ) -> tuple[LwdPrefixManifest, Mapping[str, Any], str, str | None]:
         headers = dict(request.headers)
         body = await request.json()
         if not isinstance(body, Mapping):
             raise ValueError("request body must be a JSON object")
+        required_fields = {"model", "messages", "stream", "stream_options"}
+        if set(body) != required_fields:
+            raise ValueError(
+                "request body must contain exactly model, messages, stream "
+                "and stream_options"
+            )
+        if body.get("stream") is not True:
+            raise ValueError("edge-cloud requests must set stream=true")
+        stream_options = body.get("stream_options")
+        if (
+            not isinstance(stream_options, Mapping)
+            or stream_options.get("include_usage") is not True
+        ):
+            raise ValueError("stream_options.include_usage must be true")
+        if not isinstance(body.get("model"), str) or not body["model"]:
+            raise ValueError("model must be a non-empty string")
         mm_abi_header = _negotiate_lwd_protocol_headers(
             headers,
             expected_mm_abi,
@@ -462,36 +518,39 @@ def create_lwd_cloud_control_app(
         manifest = LwdPrefixManifest.from_openai_request(parse_headers, body)
         headers_lc = {k.lower(): v for k, v in headers.items()}
         edge_id = _required_decimal_header(headers_lc, HEADER_EDGE_ID)
-        probe_nonce = _required_decimal_header(headers_lc, HEADER_PROBE_NONCE)
-        for name, expected in (
-            (HEADER_CLOUD_ID, cloud_id),
-            (HEADER_ENGINE_INDEX, dp_idx),
-        ):
-            actual = _required_decimal_header(headers_lc, name)
-            if actual != expected:
-                raise ValueError(f"{name} does not match this DP listener")
         display_request_id = manifest.request_id
         manifest = dataclass_replace(
             manifest, request_id=wrap_req_id(edge_id, display_request_id)
         )
-        return manifest, body, display_request_id, mm_abi_header, probe_nonce
+        return manifest, body, display_request_id, mm_abi_header
 
     @app.get("/health")
     async def health() -> dict[str, str]:
         return {"status": "ok"}
 
-    @app.post("/v1/lwd/probe")
-    async def probe(request: Request) -> Any:
+    @app.post("/v1/chat/completions")
+    async def chat_completions(request: Request) -> Any:
         try:
-            manifest, _, display_id, mm_abi, nonce = await parse_request(request)
-        except Exception as exc:  # noqa: BLE001
+            manifest, body, display_id, mm_abi = await parse_request(request)
+            registration = bridge.activate(manifest.request_id, dp_idx)
+        except ValueError as exc:
             return JSONResponse({"error": f"bad request: {exc}"}, status_code=400)
-        reply_key = f"{manifest.request_id}#probe:{nonce}:{cloud_id}:{dp_idx}"
+        except Exception as exc:  # noqa: BLE001
+            return JSONResponse({"error": str(exc)}, status_code=503)
+
+        reply_key = (
+            f"{manifest.request_id}#probe:{registration.prefix_nonce}:"
+            f"{cloud_id}:{dp_idx}"
+        )
         try:
             result = await bridge.probe(
                 dp_idx, manifest, reply_key=reply_key, timeout=probe_timeout
             )
+        except asyncio.CancelledError:
+            bridge.release(manifest.request_id, registration)
+            raise
         except TimeoutError as exc:
+            bridge.release(manifest.request_id, registration)
             logger.warning(
                 "[LWD][ctrl] probe timeout req=%s dp=%d: %s",
                 manifest.request_id,
@@ -500,8 +559,10 @@ def create_lwd_cloud_control_app(
             )
             return JSONResponse({"error": str(exc)}, status_code=503)
         except Exception as exc:  # noqa: BLE001
+            bridge.release(manifest.request_id, registration)
             logger.exception("[LWD][ctrl] handler probe raised")
             return JSONResponse({"error": str(exc)}, status_code=503)
+
         result = dataclass_replace(
             result,
             request_id=display_id,
@@ -510,39 +571,62 @@ def create_lwd_cloud_control_app(
         )
         protocol = PROTOCOL_VERSION_MM if mm_abi is not None else PROTOCOL_VERSION
         control_message = result.to_control_message(protocol, mm_abi)
-        headers_out = result.to_headers()
-        headers_out[HEADER_PROTOCOL] = protocol
-        if mm_abi is not None:
-            headers_out[HEADER_MM_ABI] = mm_abi
-        return JSONResponse(control_message, headers=headers_out)
-
-    @app.post("/v1/lwd/activate")
-    async def activate(request: Request) -> Any:
-        try:
-            manifest, body, display_id, mm_abi, nonce = await parse_request(request)
-            registration = bridge.activate(manifest.request_id, dp_idx, nonce)
-        except ValueError as exc:
-            return JSONResponse({"error": f"bad request: {exc}"}, status_code=400)
-        except Exception as exc:  # noqa: BLE001
-            return JSONResponse({"error": str(exc)}, status_code=503)
-        model = body.get("model", "edge-cloud-prefix")
+        control_message["prefix_nonce"] = registration.prefix_nonce
+        model = body["model"]
 
         async def events_inner() -> AsyncIterator[str]:
+            yield _sse_data(
+                _build_chunk(
+                    display_id,
+                    model,
+                    [
+                        {
+                            "index": 0,
+                            "delta": {
+                                "role": "assistant",
+                                "content": json.dumps(
+                                    control_message, separators=(",", ":")
+                                ),
+                            },
+                            "finish_reason": None,
+                        }
+                    ],
+                )
+            )
+            yield _sse_data(
+                _build_chunk(
+                    display_id,
+                    model,
+                    [{"index": 0, "delta": {}, "finish_reason": None}],
+                )
+            )
             usage_task = asyncio.create_task(
-                bridge.wait_usage(manifest.request_id, registration=registration)
+                bridge.wait_usage(
+                    manifest.request_id,
+                    request_notify_timeout=probe_timeout + 2 * PROBE_HEADROOM_S,
+                    registration=registration,
+                )
             )
             try:
+                completed: set[asyncio.Future[Any]] = set()
                 while not usage_task.done():
-                    done, _ = await asyncio.wait(
+                    completed, _ = await asyncio.wait(
                         {usage_task}, timeout=_USAGE_HEARTBEAT_INTERVAL
                     )
-                    if not done:
+                    if not completed:
                         yield ": edge-cloud-usage-pending\n\n"
                 usage = usage_task.result()
-            except asyncio.CancelledError:
-                usage_task.cancel()
+            except Exception as exc:
+                logger.warning(
+                    "[LWD][ctrl] usage wait failed req=%s: %s",
+                    manifest.request_id,
+                    exc,
+                )
+                usage = None
+            finally:
+                if not usage_task.done():
+                    usage_task.cancel()
                 await asyncio.gather(usage_task, return_exceptions=True)
-                raise
             if usage is None:
                 logger.error(
                     "[LWD][ctrl] usage unavailable req=%s: ending without usage",
@@ -551,7 +635,14 @@ def create_lwd_cloud_control_app(
                 yield ": edge-cloud-usage-unavailable\n\n"
                 yield "data: [DONE]\n\n"
                 return
-            yield _sse_data(_build_chunk(display_id, model, usage.to_openai_dict()))
+            yield _sse_data(
+                _build_chunk(
+                    display_id,
+                    model,
+                    [],
+                    usage.to_openai_dict(),
+                )
+            )
             yield "data: [DONE]\n\n"
 
         async def events() -> AsyncIterator[str]:
@@ -561,15 +652,10 @@ def create_lwd_cloud_control_app(
             finally:
                 bridge.release(manifest.request_id, registration)
 
-        protocol = PROTOCOL_VERSION_MM if mm_abi is not None else PROTOCOL_VERSION
-        headers_out = {
-            HEADER_PROTOCOL: protocol,
-            HEADER_REQUEST_ID: display_id,
-            HEADER_CLOUD_ID: str(cloud_id),
-            HEADER_ENGINE_INDEX: str(dp_idx),
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-        }
+        headers_out = result.to_headers()
+        headers_out[HEADER_PROTOCOL] = protocol
+        headers_out["Cache-Control"] = "no-cache"
+        headers_out["X-Accel-Buffering"] = "no"
         if mm_abi is not None:
             headers_out[HEADER_MM_ABI] = mm_abi
         return StreamingResponse(
@@ -607,6 +693,8 @@ def start_lwd_cloud_control_server(
 ) -> tuple[list[Any] | None, Any | None]:
     """Start all DP listeners on one loop, or fail the cloud startup."""
     lwd_config = getattr(vllm_config, "lwd_config", None)
+    if lwd_config is None:
+        return None, None
     coord_cfg = getattr(lwd_config, "coordination", None)
     if coord_cfg is None or not coord_cfg.enabled or lwd_config.role != "cloud":
         return None, None

@@ -19,7 +19,7 @@ from vllm.lwd_logger import lwd_logger
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import RequestQueue, create_request_queue
-from vllm.v1.request import Request
+from vllm.v1.request import Request, RequestStatus
 
 
 def lwd_spec_factor(vllm_config) -> int:
@@ -181,18 +181,29 @@ class LwdBaseScheduler(AsyncScheduler):
         ledger stays empty and usage events are never published.
         """
         try:
-            records = self.lwd_finished_records
-            records[request.request_id] = (
-                request.num_prompt_tokens,
-                request.num_tokens - request.num_prompt_tokens,
-                getattr(request, "lwd_prefix_nonce", 0),
+            completion_tokens: int | None = (
+                request.num_tokens - request.num_prompt_tokens
             )
-            if len(records) > 1024:
-                for stale in list(records)[:256]:
-                    records.pop(stale, None)
-                lwd_logger.warning(
-                    "[Lwd][coord] finished-record table full; evicted oldest"
+            if (
+                getattr(request, "status", None) is RequestStatus.FINISHED_ABORTED
+                and completion_tokens == 0
+            ):
+                completion_tokens = None
+            records: dict[str, tuple[int, int | None, int]] | None = self.__dict__.get(
+                "lwd_finished_records"
+            )
+            if records is not None:
+                records[request.request_id] = (
+                    request.num_prompt_tokens,
+                    completion_tokens,
+                    getattr(request, "lwd_prefix_nonce", 0),
                 )
+                if len(records) > 1024:
+                    for stale in list(records)[:256]:
+                        records.pop(stale, None)
+                    lwd_logger.warning(
+                        "[Lwd][coord] finished-record table full; evicted oldest"
+                    )
         except AttributeError:
             # Edge schedulers keep no finished-record ledger.
             pass

@@ -193,39 +193,6 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             return request.client_index
         return self._lwd_instance_id
 
-    def lwd_select_probe_target(
-        self, request: Request, hits: dict[LwdConnectionId, int]
-    ) -> LwdConnectionId:
-        """Select a probe winner without pinning or charging an account."""
-        edge_id = self._lwd_edge_id_of(request)
-        candidates = {
-            connection_id: self._lwd_accounts[connection_id]
-            for connection_id in self._lwd_connections
-            if connection_id.edge_id == edge_id
-        }
-        if hits:
-            best_hit = max(hits.values())
-            candidates = {
-                connection_id: account
-                for connection_id, account in candidates.items()
-                if hits.get(connection_id) == best_hit
-            }
-        if not candidates:
-            raise RuntimeError(f"[LWD] no probe target for edge_id={edge_id}")
-        best = min(
-            candidates.values(),
-            key=lambda account: (
-                account.score(),
-                (
-                    self._lwd_connections.index(account.connection_id)
-                    - self._lwd_last_engine
-                    - 1
-                )
-                % len(self._lwd_connections),
-            ),
-        )
-        return best.connection_id
-
     def _lwd_route_request(
         self, request_id: str, edge_id: int, preferred: LwdConnectionId | None = None
     ) -> LwdConnectionId:

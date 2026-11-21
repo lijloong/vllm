@@ -82,16 +82,6 @@ class LwdProbeRuntime:
         with contextlib.suppress(RuntimeError):
             self._loop.call_soon_threadsafe(task.cancel)
 
-    def submit_group(self, coroutines: list[Coroutine[Any, Any, Any]]) -> Future[Any]:
-        """Run a request batch with one inflight permit per candidate DP."""
-
-        async def group() -> list[Any]:
-            return await asyncio.gather(
-                *(self._bounded(coroutine) for coroutine in coroutines)
-            )
-
-        return asyncio.run_coroutine_threadsafe(group(), self._loop)
-
     def stop(self) -> None:
         """Close the HTTP session and stop the loop without blocking the engine."""
 
