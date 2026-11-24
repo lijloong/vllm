@@ -173,6 +173,11 @@ _VENDORED_MODULE_OWNERSHIP: dict[str, frozenset[str]] = {
     "model.layers": frozenset({"cloud"}),
     "model.norm": frozenset({"cloud"}),
     "visual": frozenset({"edge"}),
+    "vision": frozenset({"edge"}),
+    "aligner": frozenset({"edge"}),
+    "image_start": frozenset({"edge"}),
+    "image_end": frozenset({"edge"}),
+    "image_newline": frozenset({"edge"}),
     "model.mtp": frozenset({"cloud"}),
 }
 
@@ -189,11 +194,9 @@ _EDGE_KEEP_PATTERNS: tuple[re.Pattern[str], ...] = (
 # Tensor-level special case for BOTH roles: DeepSeek-V4's hyper-connection
 # head collapses the hc multi-stream residual at the top of the trunk
 # forward, right before the final norm. Its three tensors are FLAT
-# parameters on the model (``hc_head_{fn,base,scale}``, no dot boundary),
-# so no ownership-table row can express them and the load-time filter never
-# skips them. Both roles construct the parameters (there is no module to
-# prune at build time), so both slices keep them; only the cloud runs the
-# kernel.
+# parameters on the model (``hc_head_{fn,base,scale}``, no dot boundary).
+# There is no module to prune at build time and the load-time filter never
+# skips them, so both slices keep them; only the cloud runs the kernel.
 _BOTH_KEEP_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"^(?:model\.)?hc_head_(?:fn|base|scale)(?:\.weight)?$"),
 )

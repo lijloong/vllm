@@ -88,6 +88,12 @@ def _param_names(model: torch.nn.Module) -> set[str]:
         ("language_model.visual", "cloud", True),
         ("visual.merger.proj", "cloud", False),
         ("visual", "edge", False),
+        # DeepSeek V4/V4.1 multimodal modules also belong to the edge.
+        ("vision", "cloud", True),
+        ("model.vision", "cloud", True),
+        ("aligner", "cloud", True),
+        ("vision", "edge", False),
+        ("aligner", "edge", False),
         # Other towers are not covered by the rule.
         ("vision_tower", "cloud", False),
         # Both-role modules.
