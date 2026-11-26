@@ -578,9 +578,15 @@ def classify_safetensors(
 
 
 def collect_tensor_info(
-    src: str, keep: set[str], weight_files: set[str]
+    src: str,
+    keep: set[str],
+    weight_files: set[str],
+    weight_map: Mapping[str, str] | None,
 ) -> tuple[dict[str, TensorInfo], dict | None, int]:
     """Read headers of source shards and collect info for kept tensors.
+
+    With an index, only collect each tensor from its authoritative shard.
+    Without one, duplicate names remain an error.
 
     Returns:
         (name -> TensorInfo, first shard's ``__metadata__`` or None, payload
@@ -594,15 +600,18 @@ def collect_tensor_info(
         if shard_metadata is not None and metadata is None:
             metadata = shard_metadata
         for name, tensor in tensors.items():
-            if name in keep:
-                if name in info:
-                    raise SourceError(f"tensor {name!r} appears in multiple shards")
-                # TensorInfo from the parser holds offsets relative to the
-                # data area; make them absolute for the copy step.
-                info[name] = TensorInfo(
-                    tensor.dtype, tensor.shape, base + tensor.start, base + tensor.end
-                )
-                total += tensor.end - tensor.start
+            if name not in keep:
+                continue
+            if weight_map is not None and shard != weight_map[name]:
+                continue
+            if name in info:
+                raise SourceError(f"tensor {name!r} appears in multiple shards")
+            # TensorInfo from the parser holds offsets relative to the
+            # data area; make them absolute for the copy step.
+            info[name] = TensorInfo(
+                tensor.dtype, tensor.shape, base + tensor.start, base + tensor.end
+            )
+            total += tensor.end - tensor.start
     missing = sorted(keep - set(info))
     if missing:
         suffix = "..." if len(missing) > 5 else ""
@@ -1164,7 +1173,9 @@ def _run(argv: list[str] | None = None) -> int:
     if not keep:
         raise RuleCoverageError("no tensors matched the keep rules for this role")
 
-    info, shard_metadata, payload_bytes = collect_tensor_info(src, keep, weight_files)
+    info, shard_metadata, payload_bytes = collect_tensor_info(
+        src, keep, weight_files, weight_map if index_name is not None else None
+    )
     entries = plan_shards(info, int(args.max_shard_gb * (1 << 30)))
     print(
         f"[plan] {args.role} output: {len(entries)} shard(s), "
