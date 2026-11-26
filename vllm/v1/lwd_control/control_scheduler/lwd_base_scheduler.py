@@ -19,7 +19,7 @@ from vllm.lwd_logger import lwd_logger
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import RequestQueue, create_request_queue
-from vllm.v1.request import Request
+from vllm.v1.request import Request, RequestStatus
 
 
 def lwd_spec_factor(vllm_config) -> int:
@@ -182,9 +182,17 @@ class LwdBaseScheduler(AsyncScheduler):
         """
         try:
             records = self.lwd_finished_records
+            completion_tokens: int | None = (
+                request.num_tokens - request.num_prompt_tokens
+            )
+            if (
+                request.status is RequestStatus.FINISHED_ABORTED
+                and completion_tokens == 0
+            ):
+                completion_tokens = None
             records[request.request_id] = (
                 request.num_prompt_tokens,
-                request.num_tokens - request.num_prompt_tokens,
+                completion_tokens,
                 getattr(request, "lwd_prefix_nonce", 0),
             )
             if len(records) > 1024:

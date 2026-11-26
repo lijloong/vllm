@@ -33,6 +33,9 @@ LWD (Layerwise Disaggregated) 是基于 vLLM v1 引擎的边云分布式推理�
 - **已知缺口**: 老代码 docstring 引用的设计文档 `docs/refactor/prefill_only_migration.md` 分支上并不存在, 整改时需补齐.
 - **迁移/替换要一次做到位**: 替换一个模块后, 全仓 grep 旧设计的名字与术语 (类名、函数名、注释里的旧概念, 如 publish/HELLO/接收线程/`wire_version`), 残留的转发层、没人覆写的空默认实现、只为旧结构存在的辅助函数、过时注释, 与替换放在同一个 commit 里清掉, 不留到以后. 例: 控制面替换后删掉了 `_lwd_shutdown_comm` (失败清理已由基类 `shutdown` 统一承担) 与转发层 `_lwd_on_message`.
 
+- **HTTP 协调双模式**: 顶层 `gateway.enabled=false` 或省略 `gateway` 时使用每云 DP 的 `coord_url` 和 `/v1/lwd/probe|activate` 直连选路；`gateway.enabled=true` 时 Edge 只请求 `gateway.url` 中的完整 URL（不拼接路径），由启动 content 返回的 `cloud_id/engine_index` 绑定实际 Cloud/DP，Cloud 监听改为单流 `/v1/chat/completions`。网关模式要求每个边云实例启用 coordination；配置见 `docs/design/lwd_gateway_config.md`。
+- **网关 usage 两阶段超时**: 直连保持 `wait_usage` 原语义，只在 `usage_start` 前限时；网关使用 `wait_gateway_usage`，固定 30s 接入超时，开始后再以共享常量 `GATEWAY_USAGE_EXECUTION_TIMEOUT_S=600s` 基础预算独立计时。Edge 按 `600 + max_tokens` 秒计算执行预算并经内部 header 传递，不另设统一硬上限；缺省 `max_tokens` 与 `RequestNotify` 使用同一 LWD 默认值。不要用云端自发 SSE heartbeat 判断引擎活性。
+
 ## LWD 命名约定 (团队规范 7.5 的细化)
 
 - **一个概念一个词, 跨类名/字段/方法/异常/日志/报错文案保持一致.** 例: 控制面里"对端完成握手、可以发送"统一叫 registered (`_registered_peers`, `LwdPeerNotRegisteredError`), 不混用 ready/connected/up; 只有成对的回调 `on_peer_up`/`on_peer_down` 例外.

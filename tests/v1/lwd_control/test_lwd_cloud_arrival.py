@@ -760,6 +760,45 @@ def test_free_request_cleans_prefix_reservation_and_refill_gate(
     assert scheduler.lwd_finished_records["p"] == (10, 0, 11)
 
 
+@pytest.mark.parametrize(
+    ("completion_tokens", "expected"),
+    [(0, None), (3, 3)],
+)
+def test_abort_usage_snapshot_distinguishes_zero_and_accepted_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+    completion_tokens: int,
+    expected: int | None,
+) -> None:
+    request = _request()
+    request.num_tokens += completion_tokens
+    request.status = RequestStatus.FINISHED_ABORTED
+    request.lwd_prefix_nonce = 11
+    scheduler = _scheduler(request)
+    monkeypatch.setattr(
+        AsyncScheduler,
+        "_free_request",
+        lambda self, request, delay_free_blocks=False: (None, None),
+    )
+
+    scheduler._free_request(request)
+
+    assert scheduler.lwd_finished_records["p"] == (10, expected, 11)
+
+
+def test_publish_aborted_zero_tokens_marks_usage_unavailable() -> None:
+    engine = _engine()
+    engine.scheduler.lwd_finished_records = {"p": (16, None, 7)}
+    engine.cloud_control_event_queue = queue.Queue()
+    engine._lwd_engine_index = 1
+
+    engine._lwd_publish_finished_usage(None)
+
+    event = engine.cloud_control_event_queue.get_nowait()
+    assert event["type"] == "usage"
+    assert event["usage"] is None
+    assert engine.scheduler.lwd_finished_records == {}
+
+
 def test_publish_finished_usage_keeps_snapshot_nonce() -> None:
     engine = _engine()
     engine.scheduler.lwd_finished_records = {"p": (16, 3, 7)}

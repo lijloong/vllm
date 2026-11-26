@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncIterable, AsyncIterator, Sequence
+from collections.abc import AsyncIterable, AsyncIterator, Mapping, Sequence
 from typing import Any
 
 from vllm import envs
@@ -37,7 +37,7 @@ _MAX_CONTROL_MESSAGE_CHARS = 16 * 1024
 
 
 async def _iter_sse_data(content: AsyncIterable[bytes]) -> AsyncIterator[str]:
-    """Read SSE events, preserving multiline data and ignoring heartbeats."""
+    """Read SSE data and comment events, preserving multiline data."""
     data: list[str] = []
     size = 0
     async for raw_line in content:
@@ -48,6 +48,8 @@ async def _iter_sse_data(content: AsyncIterable[bytes]) -> AsyncIterator[str]:
                 data.clear()
                 size = 0
                 yield payload
+        elif line.startswith(":"):
+            yield line
         elif line == "data" or line.startswith("data:"):
             value = line.partition(":")[2].removeprefix(" ")
             size += len(value) + 1
@@ -77,7 +79,7 @@ class LwdEdgePrefixClient:
             raise ValueError("control_url must use http:// or https://")
         if probe_timeout <= 0:
             raise ValueError("probe_timeout must be positive")
-        self._control_url = control_url.rstrip("/")
+        self._control_url = control_url
         self._hasher = LwdPrefixHasher(tenant_key, block_size, processor_fingerprint)
         self._mm_abi_header: str | None = (
             mm_abi_header_value(processor_fingerprint)
@@ -120,7 +122,7 @@ class LwdEdgePrefixClient:
         manifest: LwdPrefixManifest,
         *,
         edge_id: int,
-        probe_nonce: int,
+        probe_nonce: int | None = None,
         model: str | None = None,
         multimodal: bool = False,
     ) -> tuple[dict[str, str], dict[str, Any]]:
@@ -134,7 +136,8 @@ class LwdEdgePrefixClient:
             headers[HEADER_PROTOCOL] = PROTOCOL_VERSION_MM
             headers[HEADER_MM_ABI] = self._mm_abi_header
         headers[HEADER_EDGE_ID] = str(edge_id)
-        headers[HEADER_PROBE_NONCE] = str(probe_nonce)
+        if probe_nonce is not None:
+            headers[HEADER_PROBE_NONCE] = str(probe_nonce)
         headers["Accept"] = "application/json"
         if self._consumer_id:
             headers["X-Mse-Consumer"] = self._consumer_id
@@ -239,13 +242,19 @@ class LwdEdgePrefixClient:
     async def _post(
         self, path: str, session: Any, headers: dict[str, str], body: dict[str, Any]
     ) -> Any:
+        url = f"{self._control_url.rstrip('/')}{path}"
+        return await self._post_url(url, session, headers, body)
+
+    async def _post_url(
+        self, url: str, session: Any, headers: dict[str, str], body: dict[str, Any]
+    ) -> Any:
         import aiohttp
 
         timeout = aiohttp.ClientTimeout(total=None, connect=self._connect_timeout)
         try:
             return await asyncio.wait_for(
                 session.post(
-                    f"{self._control_url}{path}",
+                    url,
                     json=body,
                     headers=headers,
                     timeout=timeout,
@@ -254,9 +263,11 @@ class LwdEdgePrefixClient:
             )
         except asyncio.TimeoutError as exc:
             raise RuntimeError(
-                f"control request timed out after {self._probe_timeout}s "
-                f"url={self._control_url}{path}"
+                f"control request timed out after {self._probe_timeout}s url={url}"
             ) from exc
+
+    def _decode_probe(self, message: Mapping[str, Any]) -> LwdProbeResult:
+        return LwdProbeResult.from_control_message(message)
 
     def _parse_probe(
         self,
@@ -283,7 +294,7 @@ class LwdEdgePrefixClient:
             if multimodal:
                 raise RuntimeError("cloud MM-ABI fingerprint does not match") from exc
             raise RuntimeError("cloud returned MM-ABI for a text-only probe") from exc
-        probe = LwdProbeResult.from_control_message(message)
+        probe = self._decode_probe(message)
         if probe.request_id != request_id:
             raise RuntimeError("cloud returned a different request ID")
         if probe.hit_tokens > len(prompt_token_ids):
@@ -295,17 +306,36 @@ class LwdEdgePrefixClient:
     ) -> asyncio.Task[None]:
         task = asyncio.create_task(self._drain_stream(request_id, response, sse_data))
         self._drain_tasks.add(task)
-        task.add_done_callback(self._drain_tasks.discard)
+
+        def finish(completed: asyncio.Task[None]) -> None:
+            self._drain_tasks.discard(completed)
+            try:
+                response.close()
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "[LWD][edge-client] probe stream close failed req=%s",
+                    request_id,
+                    exc_info=True,
+                )
+
+        task.add_done_callback(finish)
         return task
 
     async def _drain_stream(
         self, request_id: str, response: Any, sse_data: AsyncIterator[str]
     ) -> None:
         usage: dict | None = None
+        unavailable = False
         try:
             async for payload in sse_data:
                 if payload == "[DONE]":
                     break
+                if (
+                    payload.startswith(":")
+                    and payload[1:].strip() == "edge-cloud-usage-unavailable"
+                ):
+                    unavailable = True
+                    continue
                 try:
                     chunk = json.loads(payload)
                 except json.JSONDecodeError:
@@ -313,10 +343,16 @@ class LwdEdgePrefixClient:
                 if chunk.get("usage") is not None:
                     usage = chunk["usage"]
             if usage is None:
-                logger.warning(
-                    "[LWD][edge-client] usage missing in probe stream req=%s",
-                    request_id,
-                )
+                if unavailable:
+                    logger.info(
+                        "[LWD][edge-client] usage unavailable in stream req=%s",
+                        request_id,
+                    )
+                else:
+                    logger.warning(
+                        "[LWD][edge-client] usage missing in probe stream req=%s",
+                        request_id,
+                    )
                 return
             details = usage.get("prompt_tokens_details") or {}
             logger.info(
