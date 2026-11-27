@@ -2,7 +2,7 @@ name: LWD Fast
 
 on:
   pull_request:
-    branches: [main]
+    branches: [main, releases/v0.30.0]
     types: [opened, synchronize, reopened, edited]
 
 concurrency:
