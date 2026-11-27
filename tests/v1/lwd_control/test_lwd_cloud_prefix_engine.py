@@ -11,6 +11,7 @@ import torch
 from vllm.config.lwd import LwdConnectionId
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
+from vllm.v1.engine import EngineCoreRequestType
 from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_engine import (
     LwdCloudEngineCoreMixin,
 )
@@ -18,7 +19,11 @@ from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_ledger import (
     LwdCloudLedger,
 )
 from vllm.v1.lwd_control.control_scheduler.lwd_base_engine import LwdBaseEngineCore
-from vllm.v1.lwd_control.lwd_comm.lwd_messages import LwdRequestNotify
+from vllm.v1.lwd_control.lwd_comm.lwd_link_protocol import LwdPeer
+from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
+    LwdAbortNotify,
+    LwdRequestNotify,
+)
 from vllm.v1.request import RequestStatus
 
 _CONNECTION = LwdConnectionId(0, 0, 0)
@@ -27,8 +32,12 @@ _CONNECTION = LwdConnectionId(0, 0, 0)
 def _cloud_engine() -> LwdCloudEngineCoreMixin:
     engine = object.__new__(LwdCloudEngineCoreMixin)
     engine._lwd_prefix_enabled = True
-    engine.scheduler = SimpleNamespace()
+    # Retirement (abort) touches these two scheduler maps; a bare
+    # SimpleNamespace would raise AttributeError inside retire_request.
+    engine.scheduler = SimpleNamespace(lwd_recv_rows={}, pending_c2e=[])
     engine._lwd_ledger = LwdCloudLedger(engine.scheduler)
+    # A legitimate ADD always follows a RequestNotify that registered the route.
+    engine._lwd_ledger.request_routes["r"] = object()
     engine._lwd_send_prefix_ready = Mock()
     engine._lwd_engine_index = 0
     engine.cloud_control_event_queue = queue.Queue()
@@ -375,3 +384,179 @@ def test_prefix_with_kv_connector_fails_before_startup() -> None:
 
     with pytest.raises(ValueError, match="external hits bypass.*READY"):
         LwdCloudEngineCoreMixin(vllm_config=config, lwd_dp_size=1)
+
+
+def test_stale_add_after_abort_is_dropped_without_scheduling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Abort retiring the generation before the ADD is consumed must not
+    resurrect the request: no native add, no READY, no reservation, no raise."""
+    engine = _cloud_engine()
+    engine._lwd_ledger.request_routes.pop("r")
+    engine._lwd_ledger.retired_routes["r"] = object()
+    engine._lwd_ledger.retire_pending_add("r", 7)
+    reservations = Mock()
+    engine.scheduler.lwd_prefix_reservations = reservations
+    request = SimpleNamespace(
+        request_id="r", lwd_prefix_nonce=7, lwd_wire_hashes_adopted=True
+    )
+    native_add = Mock()
+    monkeypatch.setattr(LwdBaseEngineCore, "add_request", native_add)
+
+    engine.add_request(request)
+
+    native_add.assert_not_called()
+    reservations.reserve.assert_not_called()
+    engine._lwd_send_prefix_ready.assert_not_called()
+    assert engine.cloud_control_event_queue.empty()
+    # The tombstone is consumed exactly once.
+    assert engine._lwd_ledger.retired_pending_add == {}
+
+
+def test_add_without_route_or_tombstone_fails_fast() -> None:
+    """An ADD that never followed RequestNotify is a wiring bug, not a race."""
+    engine = _cloud_engine()
+    engine._lwd_ledger.request_routes.pop("r")
+    request = SimpleNamespace(
+        request_id="r", lwd_prefix_nonce=7, lwd_wire_hashes_adopted=True
+    )
+
+    with pytest.raises(RuntimeError, match="ADD without a request route"):
+        engine.add_request(request)
+
+
+def test_new_generation_after_abort_is_admitted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A different nonce is a fresh generation and must still be admitted."""
+    engine = _cloud_engine()
+    reservations = Mock()
+    reservations.reserve.return_value = 32
+    engine.scheduler.lwd_prefix_reservations = reservations
+    engine._lwd_ledger.retire_pending_add("r", 6)
+    request = SimpleNamespace(
+        request_id="r", lwd_prefix_nonce=7, lwd_wire_hashes_adopted=True
+    )
+    added = []
+    monkeypatch.setattr(
+        LwdBaseEngineCore, "add_request", lambda _self, req, wave=0: added.append(req)
+    )
+
+    engine.add_request(request)
+
+    assert added == [request]
+    engine._lwd_send_prefix_ready.assert_called_once_with("r", 32, 7)
+    # A fresh generation releases the stale tombstone on its way in.
+    assert engine._lwd_ledger.retired_pending_add == {}
+
+
+def test_send_prefix_ready_without_route_does_not_raise() -> None:
+    engine = object.__new__(LwdCloudEngineCoreMixin)
+    engine._lwd_ledger = LwdCloudLedger(SimpleNamespace())
+
+    engine._lwd_send_prefix_ready("gone", 0, 7, error="boom")
+
+
+def test_send_refill_without_route_does_not_raise() -> None:
+    engine = object.__new__(LwdCloudEngineCoreMixin)
+    engine._lwd_ledger = LwdCloudLedger(SimpleNamespace())
+
+    engine._lwd_send_refill("gone", 16, 32, 7)
+
+
+def test_abort_before_queued_add_drops_stale_generation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End-to-end of the race: RequestNotify registered the route, AbortNotify
+    is processed first, then the queued ADD must be dropped silently."""
+    engine = _cloud_engine()
+    engine.scheduler.requests = {}
+    engine.scheduler._lwd_refill_gate = set()
+    engine.scheduler._lwd_refill_pending = {}
+    engine.scheduler.lwd_prefix_reservations = Mock()
+    engine.aborts_queue = queue.Queue()
+    engine.input_queue = queue.Queue()
+    engine._lwd_ledger.request_nonces["r"] = 7
+    request = SimpleNamespace(
+        request_id="r", lwd_prefix_nonce=7, lwd_wire_hashes_adopted=True
+    )
+    native_add = Mock()
+    monkeypatch.setattr(LwdBaseEngineCore, "add_request", native_add)
+
+    engine._lwd_handle_abort_notify(LwdAbortNotify("r", prefix_nonce=7))
+    assert engine._lwd_ledger.retired_pending_add == {"r": 7}
+
+    engine.add_request(request)
+
+    native_add.assert_not_called()
+    engine._lwd_send_prefix_ready.assert_not_called()
+    assert engine._lwd_ledger.retired_pending_add == {}
+
+
+def test_abort_overtakes_queued_add(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """FIFO-faithful race reproduction.
+
+    RequestNotify and AbortNotify both land on the IO thread first. Processing
+    RequestNotify appends its ADD to the queue tail, so the abort is consumed
+    before that ADD; the abort retires the route and the late ADD must be
+    dropped silently instead of resurrecting the cancelled generation.
+    """
+    engine = object.__new__(LwdCloudEngineCoreMixin)
+    engine._lwd_prefix_enabled = True
+    engine.lwd_config = SimpleNamespace(instance_id=0)
+    engine.engines_running = False
+    engine.scheduler = SimpleNamespace(
+        requests={},
+        _lwd_refill_gate=set(),
+        _lwd_refill_pending={},
+        lwd_recv_rows={},
+        pending_c2e=[],
+        lwd_prefix_reservations=Mock(),
+    )
+    engine.scheduler.lwd_prefix_reservations.reserve.return_value = 32
+    engine._lwd_ledger = LwdCloudLedger(engine.scheduler)
+    engine._lwd_engine_index = 0
+    engine.cloud_control_event_queue = queue.Queue()
+    engine.aborts_queue = queue.Queue()
+    engine.input_queue = queue.Queue()
+    engine._lwd_send_prefix_ready = Mock()
+    # This case pins queue ordering and route retirement, not request building.
+    monkeypatch.setattr(
+        LwdCloudEngineCoreMixin,
+        "_lwd_build_request",
+        lambda _self, notify: SimpleNamespace(
+            request_id=notify.request_id,
+            lwd_prefix_nonce=notify.prefix_nonce,
+            lwd_wire_hashes_adopted=True,
+            use_structured_output=False,
+        ),
+    )
+    added: list[object] = []
+    monkeypatch.setattr(
+        LwdBaseEngineCore,
+        "add_request",
+        lambda _self, req, wave=0: added.append(req),
+    )
+
+    peer = LwdPeer(0, 0)
+    engine.input_queue.put_nowait(
+        (EngineCoreRequestType.WAKEUP, (peer, LwdRequestNotify("r", 4, prefix_nonce=7)))
+    )
+    engine.input_queue.put_nowait(
+        (EngineCoreRequestType.WAKEUP, (peer, LwdAbortNotify("r", prefix_nonce=7)))
+    )
+
+    # Drain in FIFO order exactly as the engine thread would: RequestNotify
+    # appends its ADD behind the queued abort, so the abort runs first.
+    while not engine.input_queue.empty():
+        request_type, payload = engine.input_queue.get_nowait()
+        if request_type == EngineCoreRequestType.WAKEUP:
+            engine._lwd_handle_edge_message(*payload)
+        elif request_type == EngineCoreRequestType.ADD:
+            engine.add_request(payload[0], payload[1])
+
+    assert added == []
+    engine._lwd_send_prefix_ready.assert_not_called()
+    assert engine._lwd_ledger.retired_pending_add == {}

@@ -334,7 +334,17 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
     ) -> None:
         peer = self._lwd_ledger.request_routes.get(request_id)
         if peer is None:
-            raise RuntimeError(f"[LWD] prefix reply route missing for {request_id}")
+            # The edge aborted this generation (or its connection failed)
+            # after the route was retired: a cancelled request has no reply
+            # destination. Reaching here means a route outlived its
+            # generation, which add_request's entry guard should have caught;
+            # log at error to surface that invariant break.
+            lwd_logger.error(
+                "[LWD][prefix] drop READY req=%s nonce=%d: generation already retired",
+                request_id,
+                nonce,
+            )
+            return
         self._lwd_send_until_queued(
             peer,
             LwdPrefixReadyNotify(unwrap_req_id(request_id), hit_tokens, nonce, error),
@@ -352,7 +362,15 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
     ) -> None:
         peer = self._lwd_ledger.request_routes.get(request_id)
         if peer is None:
-            raise RuntimeError(f"[LWD] refill route missing for {request_id}")
+            # Same abort-before-send race as READY: the generation was already
+            # retired, so there is no edge to refill. Log at error to surface
+            # a route that outlived its generation.
+            lwd_logger.error(
+                "[LWD][prefix] drop REFILL req=%s nonce=%d: generation already retired",
+                request_id,
+                prefix_nonce,
+            )
+            return
         self._lwd_send_until_queued(
             peer,
             LwdRefillNotify(
@@ -382,6 +400,21 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
 
     def add_request(self, request: Request, request_wave: int = 0) -> None:
         nonce = getattr(request, "lwd_prefix_nonce", 0)
+        request_id = request.request_id
+        if self._lwd_ledger.consume_stale_add(request_id, nonce):
+            # The edge aborted this generation after its RequestNotify but
+            # before this queued ADD was consumed: never resurrect it.
+            lwd_logger.info(
+                "[LWD][cloud] drop stale ADD req=%s nonce=%d: generation "
+                "already aborted",
+                request_id,
+                nonce,
+            )
+            return
+        if request_id not in self._lwd_ledger.request_routes:
+            # Every legitimate ADD follows a RequestNotify that registered the
+            # route; a missing route with no abort tombstone is a wiring bug.
+            raise RuntimeError(f"[LWD] ADD without a request route: {request_id}")
         if not self._lwd_prefix_enabled:
             super().add_request(request, request_wave)
             self._lwd_publish_usage_start(request)
@@ -389,11 +422,10 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         if not nonce:
             lwd_logger.error(
                 "[LWD][prefix] reject req=%s: missing prefix nonce",
-                request.request_id,
+                request_id,
             )
             return
 
-        request_id = request.request_id
         if request_id in getattr(self.scheduler, "requests", {}):
             self._lwd_send_prefix_ready(
                 request_id, 0, nonce, error="duplicate active request id"
@@ -655,6 +687,10 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         reservations = getattr(self.scheduler, "lwd_prefix_reservations", None)
         if reservations is not None:
             reservations.release(request_id)
+        if request_id not in getattr(self.scheduler, "requests", {}):
+            # The matching ADD may still be queued (abort won the race); guard
+            # it so the late ADD drops instead of resurrecting this generation.
+            ledger.retire_pending_add(request_id, notify.prefix_nonce)
         ledger.retire_request(request_id, preserve_prompt=True)
         lwd_logger.info(
             "[LWD][cloud] abort req=%s nonce=%d", request_id, notify.prefix_nonce
@@ -924,6 +960,12 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             if self._lwd_connection_of(peer) == connection
         ]
         for request_id in request_ids:
+            if request_id not in getattr(self.scheduler, "requests", {}):
+                # Same abort-before-ADD race as a plain abort: guard the
+                # queued ADD so it drops instead of resurrecting the request.
+                ledger.retire_pending_add(
+                    request_id, ledger.request_nonces.get(request_id, 0)
+                )
             ledger.retire_request(request_id, preserve_prompt=True)
             self.aborts_queue.put_nowait([request_id])
             self.input_queue.put_nowait((EngineCoreRequestType.ABORT, [request_id]))
