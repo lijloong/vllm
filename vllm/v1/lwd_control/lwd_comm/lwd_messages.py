@@ -21,11 +21,7 @@ T = TypeVar("T")
 # Version 5: LwdRequestNotify carries `structured_outputs`. An old cloud would
 # drop the constraint silently (msgspec skips unknown fields on decode), so
 # mixed versions fail the handshake instead of serving unstructured output.
-# Version 6: LwdRequestNotify carries `extra_args`. An old cloud would decode
-# the request but rebuild `SamplingParams` without the trusted scheme-3.1
-# backend route keys, so its grammar gate would reject the first rewritten
-# constraint at runtime; the handshake fails earlier instead.
-LWD_MESSAGE_VERSION = 6
+LWD_MESSAGE_VERSION = 5
 
 LWD_NOT_FINISHED = -1
 """`LwdC2eNotify.finish_reasons` value of a request still running."""
