@@ -144,9 +144,7 @@ def test_request_notify_round_trips_extra_args_route_keys() -> None:
     assert isinstance(decoded, LwdRequestNotify)
     assert decoded.extra_args == route
     plain = lwd_decode_edge_to_cloud(
-        lwd_encode_message(
-            LwdRequestNotify(request_id="r2", num_prompt_tokens=1)
-        )
+        lwd_encode_message(LwdRequestNotify(request_id="r2", num_prompt_tokens=1))
     )
     assert isinstance(plain, LwdRequestNotify)
     assert plain.extra_args is None
