@@ -29,6 +29,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from vllm.logger import init_logger
+from vllm.lwd_logger import lwd_logger
 from vllm.v1.lwd_control.lwd_comm.lwd_id_adapter import wrap_req_id
 from vllm.v1.lwd_control.lwd_comm.lwd_mm_identity import (
     compute_processor_fingerprint,
@@ -691,7 +692,14 @@ def start_lwd_cloud_control_server(
     bridge = LwdCloudControlBridge(command_queues, event_queue)
     bridge.start()
     cloud_probe_timeout = max(coord_cfg.probe_timeout - PROBE_HEADROOM_S, 1.0)
+    # The front-end never builds the model, so its hf_config is still the
+    # pre-worker one the edge snapshots in _lwd_prepare.
     fingerprint = compute_processor_fingerprint(vllm_config.model_config)
+    lwd_logger.info(
+        "[mm-abi] role=cloud instance_id=%s fingerprint=%s",
+        lwd_config.instance_id,
+        mm_abi_header_value(fingerprint),
+    )
     mode = "gateway" if lwd_config.topology.gateway.enabled else "direct"
     app_factory = create_lwd_cloud_control_app
     if lwd_config.topology.gateway.enabled:

@@ -73,9 +73,11 @@ class LwdBaseEngineCore(EngineCoreProc):
     """EngineCoreProc of an LWD edge or cloud.
 
     Subclasses declare `lwd_scheduler_cls`, injected before `super()`, which
-    builds the scheduler from `scheduler_cls` once. Upstream disables chunked
-    prefill for deployments without KV cache groups, while LWD edge chunks are
-    pure scheduling bookkeeping, so it is restored for LWD engines afterwards.
+    builds the scheduler from `scheduler_cls` once. `_lwd_prepare` also runs
+    before `super()`, i.e. pre-worker: neither the executor and its workers
+    nor the model exist yet. Upstream disables chunked prefill for
+    deployments without KV cache groups, while LWD edge chunks are pure
+    scheduling bookkeeping, so it is restored for LWD engines afterwards.
     `_lwd_assemble` then sets up the role and starts the control plane; READY
     has already reached the frontend by then.
     """
@@ -92,6 +94,7 @@ class LwdBaseEngineCore(EngineCoreProc):
         scheduler_config = vllm_config.scheduler_config
         scheduler_config.scheduler_cls = self.lwd_scheduler_cls
         chunked_prefill_wanted = scheduler_config.enable_chunked_prefill
+        self._lwd_prepare(vllm_config)
         super().__init__(*args, **kwargs)
         if not scheduler_config.enable_chunked_prefill and chunked_prefill_wanted:
             scheduler_config.enable_chunked_prefill = True
@@ -103,6 +106,9 @@ class LwdBaseEngineCore(EngineCoreProc):
             # the executor and the control plane before failing startup.
             self.shutdown()
             raise
+
+    def _lwd_prepare(self, vllm_config: Any) -> None:
+        """Pre-worker role setup, before the engine and its model are built."""
 
     def _lwd_assemble(self) -> None:
         """Role setup once the engine is built, including the control plane."""
