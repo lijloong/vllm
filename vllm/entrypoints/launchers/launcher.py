@@ -254,7 +254,10 @@ def validate_api_server_args(args):
 @instrument(span_name="API server setup")
 def setup_server(args, *, reuse_port: bool):
     """Validate API server args and create the server socket."""
+    from vllm.tokenizers.lwd_tokenizer_obfuscation import run_obfuscation_hook
 
+    # Select trusted deployment handlers before importing frontend plugins.
+    run_obfuscation_hook("configure_server_args", args)
     log_version_and_model(logger, VLLM_VERSION, args.model)
     log_non_default_args(args)
 

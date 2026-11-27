@@ -125,6 +125,31 @@ def test_request_notify_round_trips_structured_outputs() -> None:
     assert decoded.structured_outputs == wire
 
 
+def test_request_notify_round_trips_extra_args_route_keys() -> None:
+    route = {
+        "scheme31_backend": "xgrammar",
+        "scheme31_profile_id": "p",
+        "scheme31_artifact_digest": "d",
+        "scheme31_permutation_commitment": "c",
+    }
+    decoded = lwd_decode_edge_to_cloud(
+        lwd_encode_message(
+            LwdRequestNotify(
+                request_id="r1",
+                num_prompt_tokens=1,
+                extra_args=route,
+            )
+        )
+    )
+    assert isinstance(decoded, LwdRequestNotify)
+    assert decoded.extra_args == route
+    plain = lwd_decode_edge_to_cloud(
+        lwd_encode_message(LwdRequestNotify(request_id="r2", num_prompt_tokens=1))
+    )
+    assert isinstance(plain, LwdRequestNotify)
+    assert plain.extra_args is None
+
+
 def test_request_notify_round_trips_reasoning_metadata() -> None:
     kwargs = {"chat_template_kwargs": {"enable_thinking": False}}
     decoded = lwd_decode_edge_to_cloud(
