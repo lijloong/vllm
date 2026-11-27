@@ -328,11 +328,49 @@ class LwdDPConnection:
 
 
 @dataclass(frozen=True, config=ConfigDict(extra="forbid"))
+class LwdGateway:
+    """Explicit Edge-to-gateway entrypoint; Cloud selection stays at the gateway."""
+
+    enabled: StrictBool = False
+    url: LwdString | None = None
+    connect_timeout: LwdPositiveSeconds = 10.0
+
+    @model_validator(mode="after")
+    def validate_url(self) -> "LwdGateway":
+        if self.enabled and self.url is None:
+            raise ValueError("[LWD] enabled gateway requires a URL")
+        if self.url is None:
+            return self
+        value = self.url
+        if any(char.isspace() for char in value):
+            raise ValueError("[LWD] gateway URL must not contain whitespace")
+        try:
+            url = urlsplit(value)
+            _ = url.port
+        except ValueError as exc:
+            raise ValueError(f"[LWD] invalid gateway URL: {exc}") from exc
+        if (
+            url.scheme not in ("http", "https")
+            or not url.hostname
+            or not url.path
+            or url.path == "/"
+            or url.fragment
+            or url.username is not None
+        ):
+            raise ValueError(
+                "[LWD] gateway.url must be a complete HTTP(S) URL "
+                "with a non-root path and without credentials or fragments"
+            )
+        return self
+
+
+@dataclass(frozen=True, config=ConfigDict(extra="forbid"))
 class LwdTopology:
     deployment: LwdDeployment
     feature_ctrl: LwdFeatures
     edges: Annotated[tuple[LwdInstance, ...], Field(min_length=1)]
     clouds: Annotated[tuple[LwdInstance, ...], Field(min_length=1)]
+    gateway: LwdGateway = Field(default_factory=LwdGateway)
     instance_links: Annotated[tuple[LwdLink, ...], Field(min_length=1)] | None = None
     qos: LwdQoS | None = None
     control_plane: LwdControlPlaneConfig = Field(default_factory=LwdControlPlaneConfig)
@@ -431,6 +469,7 @@ class LwdTopology:
                 )
         self._validate_scene()
         self._validate_coordination()
+        self._validate_gateway()
         if len({len(instance.dp) for instance in (*self.edges, *self.clouds)}) != 1:
             raise ValueError(
                 "[LWD] Instances must have matching DP indices and the same DP count"
@@ -509,6 +548,17 @@ class LwdTopology:
                 raise ValueError(
                     "[LWD] enabled edge coordination requires coord_port "
                     "on every linked cloud DP"
+                )
+
+    def _validate_gateway(self) -> None:
+        if not self.gateway.enabled:
+            return
+        for instance in (*self.edges, *self.clouds):
+            coordination = instance.coordination
+            if coordination is None or not coordination.enabled:
+                raise ValueError(
+                    "[LWD] enabled gateway requires enabled coordination "
+                    "on every Edge and Cloud instance"
                 )
 
     def _validate_ranks(self) -> None:

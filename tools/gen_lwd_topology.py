@@ -132,6 +132,8 @@ def build_topology(
     connect_timeout: float = 5.0,
     listen_host: str = "0.0.0.0",
     coord_port_base: int = 8100,
+    gateway_url: str | None = None,
+    gateway_connect_timeout: float = 10.0,
 ) -> dict[str, Any]:
     """Allocate global ranks; host-local physical devices remain launch settings."""
     if scene not in SCENES:
@@ -211,6 +213,17 @@ def build_topology(
                 "enabled": True,
                 "listen_host": listen_host,
             }
+    elif gateway_url is not None:
+        # Gateway mode requires coordination on every instance; scenes that
+        # never emit coordination blocks get the minimal explicit block.
+        for instance in (*edges, *clouds):
+            instance["coordination"] = {"enabled": True}
+    if gateway_url is not None:
+        result["gateway"] = {
+            "enabled": True,
+            "url": gateway_url,
+            "connect_timeout": gateway_connect_timeout,
+        }
     return result
 
 
@@ -273,6 +286,17 @@ def main() -> None:
         help="cloud_share/lwd_cluster: cloud DP coordination listen host",
     )
     parser.add_argument(
+        "--gateway-url",
+        default=None,
+        help="Enable explicit gateway mode with one complete HTTP(S) endpoint",
+    )
+    parser.add_argument(
+        "--gateway-connect-timeout",
+        type=float,
+        default=10.0,
+        help="gateway mode: edge->gateway connect timeout (seconds)",
+    )
+    parser.add_argument(
         "-o", "--output", type=Path, required=True, help="One output YAML file"
     )
     args = parser.parse_args()
@@ -289,6 +313,8 @@ def main() -> None:
             connect_timeout=args.connect_timeout,
             listen_host=args.listen_host,
             coord_port_base=args.coord_port_base,
+            gateway_url=args.gateway_url,
+            gateway_connect_timeout=args.gateway_connect_timeout,
         )
         raw["feature_ctrl"] = {
             "enable_early_recv": args.enable_early_recv,

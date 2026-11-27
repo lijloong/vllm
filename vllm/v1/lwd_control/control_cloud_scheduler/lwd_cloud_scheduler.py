@@ -91,7 +91,7 @@ class LwdCloudScheduler(LwdBaseScheduler):
         self._lwd_diag = LwdControlDiag()
         self.pending_c2e: list[LwdC2eNotify] = []
         self._lwd_prefill_group_cursor = 0
-        self.lwd_finished_records: dict[str, tuple[int, int, int]] = {}
+        self.lwd_finished_records: dict[str, tuple[int, int | None, int]] = {}
         self.lwd_hash_block_size = 0
         self.lwd_prefix_hits: dict[str, int] = {}
         self.lwd_refill_sender = None
@@ -156,13 +156,15 @@ class LwdCloudScheduler(LwdBaseScheduler):
         return decode_exact
 
     def _lwd_prep_prefix_readmission(self, request: Request) -> bool:
-        """Revalidate a preempted request against live blocks and arrivals."""
-        if not getattr(request, "lwd_prefix_probe_succeeded", True):
-            # Fail-open requests have no initial reservation by contract.
-            # Recompute the full prompt after preemption instead of creating a
-            # fictitious zero-hit reservation or triggering a refill.
-            self.lwd_prefix_hits[request.request_id] = 0
-            return True
+        """Revalidate a preempted request against live blocks and arrivals.
+
+        Every admitted request went through nonce/READY negotiation: it
+        carries a reservation floor and its staged prompt may be trimmed up
+        to that floor, regardless of whether the edge's gateway probe
+        succeeded. Readmission must therefore never bypass this
+        revalidation: scheduling below the floor without a refill reads
+        host-stage rows the edge never sent.
+        """
         reservations = getattr(self, "lwd_prefix_reservations", None)
         assert reservations is not None
         floor = self.lwd_prefix_hits.get(

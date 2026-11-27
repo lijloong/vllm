@@ -43,6 +43,9 @@ from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_probe import (
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_scheduler import (
     LwdEdgeScheduler,
 )
+from vllm.v1.lwd_control.control_edge_scheduler.lwd_gateway_activation import (
+    LwdGatewayActivationManager,
+)
 from vllm.v1.lwd_control.control_scheduler.lwd_base_engine import (
     LwdBaseEngineCore,
 )
@@ -61,6 +64,10 @@ from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
     lwd_decode_cloud_to_edge,
     lwd_encode_reasoning_parser_kwargs,
     lwd_encode_structured_outputs,
+)
+from vllm.v1.lwd_control.lwd_comm.lwd_mm_identity import (
+    compute_processor_fingerprint,
+    mm_abi_header_value,
 )
 from vllm.v1.request import Request
 
@@ -92,6 +99,21 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
     lwd_scheduler_cls = LwdEdgeScheduler
     scheduler: LwdEdgeScheduler
 
+    def _lwd_prepare(self, vllm_config: Any) -> None:
+        # Hash the MM identity pre-worker, like the cloud front-end does:
+        # Ascend model construction normalizes hf_config in place.
+        self._lwd_processor_fingerprint: bytes | None = None
+        coordination = vllm_config.lwd_config.coordination
+        if coordination is None or not coordination.enabled:
+            return
+        fingerprint = compute_processor_fingerprint(vllm_config.model_config)
+        lwd_logger.info(
+            "[mm-abi] role=edge instance_id=%s fingerprint=%s",
+            vllm_config.lwd_config.instance_id,
+            mm_abi_header_value(fingerprint),
+        )
+        self._lwd_processor_fingerprint = fingerprint
+
     def _lwd_assemble(self) -> None:
         self._lwd_prefix_enabled = bool(
             self.vllm_config.cache_config.enable_prefix_caching
@@ -102,9 +124,19 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             else None
         )
         self._lwd_cloud_params: dict[LwdConnectionId, LwdCloudParamsNotify] = {}
-        self._lwd_probe_manager = LwdEdgeProbeManager(
+        gateway = self.lwd_config.topology.gateway
+        lwd_logger.info(
+            "[LWD] coordination mode=%s gateway_url=%s",
+            "gateway" if gateway.enabled else "direct",
+            gateway.url if gateway.enabled else "-",
+        )
+        manager_cls = (
+            LwdGatewayActivationManager if gateway.enabled else LwdEdgeProbeManager
+        )
+        self._lwd_probe_manager = manager_cls(
             self.vllm_config,
             lambda: self.input_queue.put_nowait((EngineCoreRequestType.WAKEUP, None)),
+            processor_fingerprint=self._lwd_processor_fingerprint,
         )
         self._lwd_probe_chains: dict[str, list[bytes]] = {}
         self.scheduler.lwd_on_finish = self._lwd_finish_request
@@ -299,7 +331,10 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             control.add_request(request)
             return
         submission = self._lwd_probe_manager.submit(request)
-        if submission is not LwdProbeSubmission.UNAVAILABLE:
+        if submission is LwdProbeSubmission.SUBMITTED:
+            return
+        if submission is LwdProbeSubmission.FAILED:
+            self._lwd_abort_internally(request)
             return
         self._lwd_add_request_after_probe(request)
 
@@ -365,7 +400,6 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         preferred = self._lwd_preferred_connection(completion)
         if completion is not None:
             request.lwd_prefix_nonce = completion.probe_nonce
-        request.lwd_prefix_probe_succeeded = False
         if completion is not None and completion.chain is not None:
             self._lwd_probe_chains[request.request_id] = completion.chain
         if completion is not None and completion.result is not None:
@@ -375,7 +409,6 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
                 or not self._lwd_prefix_enabled
                 or request.skip_reading_prefix_cache
             )
-            request.lwd_prefix_probe_succeeded = not placement_only
             hit = 0 if placement_only else completion.result.hit_tokens
             hit = min(max(hit, 0), max(request.num_prompt_tokens - 1, 0))
             alignment = completion.result.alignment_tokens
@@ -421,7 +454,10 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
                     ),
                     None,
                 )
-                if not self._lwd_probe_manager.activate(completion, target, candidate):
+                manager = self._lwd_probe_manager
+                if isinstance(manager, LwdEdgeProbeManager) and not manager.activate(
+                    completion, target, candidate
+                ):
                     lwd_logger.warning(
                         "[edge-probe] stale activation req=%s ignored",
                         completion.request.request_id,
@@ -506,9 +542,6 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
                     )
                 ),
                 prefix_hit_tokens=request.num_computed_tokens,
-                prefix_probe_succeeded=getattr(
-                    request, "lwd_prefix_probe_succeeded", False
-                ),
                 mrope_positions=self.scheduler.lwd_mrope_positions(request.request_id),
                 image_placeholder_spans=metadata.image_placeholder_spans,
                 structured_outputs=(

@@ -9,13 +9,14 @@ from .coordination import LwdCoordinationConfig
 from .entry import LwdConfig
 from .logging import log_lwd_config
 from .tokenizer_obfuscation import apply_obfuscation_additional_config
-from .topology import LwdConnectionId, LwdTopology
+from .topology import LwdConnectionId, LwdGateway, LwdTopology
 
 __all__ = [
     "LwdAPIConfig",
     "LwdConfig",
     "LwdConnectionId",
     "LwdCoordinationConfig",
+    "LwdGateway",
     "LwdTopology",
     "apply_obfuscation_additional_config",
     "log_lwd_config",

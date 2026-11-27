@@ -51,6 +51,45 @@ def test_explicit_card_counts_reproduce_original_payloads(
     assert list(tmp_path.iterdir()) == [output]
 
 
+@pytest.mark.parametrize(
+    "scene,edges,clouds,cards",
+    [
+        ("single_instance", "10.0.0.1", "10.1.0.1", "0:8"),
+        ("cloud_share", "0@10.0.0.1,1@10.0.0.2", "10.1.0.1", "0:8"),
+    ],
+)
+def test_gateway_url_emits_explicit_gateway_mode(
+    tmp_path: Path, scene: str, edges: str, clouds: str, cards: str
+) -> None:
+    output = tmp_path / "topology.yaml"
+    url = "https://gateway.example.com/tenant-a/v1/chat/completions?route=blue"
+    result = generate(
+        output,
+        scene=scene,
+        edge_machines=edges,
+        cloud_machines=clouds,
+        cloud_cards=cards,
+        dp="1",
+        gateway_url=url,
+        gateway_connect_timeout="3.0",
+    )
+    assert result.returncode == 0, result.stderr
+    raw = yaml.safe_load(output.read_text())
+    assert raw["gateway"] == {
+        "enabled": True,
+        "url": url,
+        "connect_timeout": 3.0,
+    }
+    # Gateway mode requires coordination on every edge and cloud instance.
+    assert all(
+        instance["coordination"]["enabled"]
+        for instance in (*raw["edges"], *raw["clouds"])
+    )
+    topology = LwdTopology.from_file(str(output))
+    assert topology.gateway.enabled
+    assert topology.gateway.url == url
+
+
 def test_explicit_colocated_ids_generate_independent_ranks(tmp_path: Path) -> None:
     output = tmp_path / "topology.yaml"
     generate(

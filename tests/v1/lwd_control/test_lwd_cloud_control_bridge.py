@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import queue
 import time
 from collections.abc import AsyncIterator, Callable
@@ -22,11 +23,15 @@ from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_control import (
     create_lwd_cloud_control_app,
     start_lwd_cloud_control_server,
 )
+from vllm.v1.lwd_control.control_cloud_scheduler.lwd_gateway_control import (
+    create_lwd_gateway_control_app,
+)
 from vllm.v1.lwd_control.lwd_comm.lwd_prefix import (
     HEADER_CLOUD_ID,
     HEADER_EDGE_ID,
     HEADER_ENGINE_INDEX,
     HEADER_PROBE_NONCE,
+    HEADER_USAGE_EXECUTION_TIMEOUT_MS,
     LwdPrefixManifest,
     LwdProbeResult,
     LwdUsage,
@@ -45,7 +50,9 @@ async def bridge_factory() -> AsyncIterator[BridgeFactory]:
     def make_bridge(
         engine_count: int,
     ) -> tuple[LwdCloudControlBridge, list[queue.Queue[Any]], queue.Queue[Any]]:
-        command_queues = [queue.Queue() for _ in range(engine_count)]
+        command_queues: list[queue.Queue[Any]] = [
+            queue.Queue() for _ in range(engine_count)
+        ]
         event_queue: queue.Queue[Any] = queue.Queue()
         bridge = LwdCloudControlBridge(command_queues, event_queue)
         bridge.start()
@@ -113,7 +120,7 @@ async def _start_probe(
     await asyncio.sleep(0)
     command = command_queue.get_nowait()
     assert command["type"] == "probe"
-    assert command["reserve"] is False
+    assert "reserve" not in command
     assert command["engine_index"] == dp_idx
     assert command["reply_key"] == key
     assert command["deadline"] == command["t_cmd"] + timeout
@@ -412,6 +419,9 @@ def test_probe_result_requires_and_serializes_explicit_dp_identity() -> None:
     }
     with pytest.raises(ValueError, match="engine_index"):
         LwdProbeResult.from_control_message(missing_engine)
+    gateway_result = LwdProbeResult.from_gateway_control_message(missing_engine)
+    assert gateway_result.engine_index is None
+    assert "engine_index" not in gateway_result.to_control_message()
     missing_cloud = {
         key: value for key, value in headers.items() if key != HEADER_CLOUD_ID
     }
@@ -551,3 +561,312 @@ def test_any_dp_bind_failure_fails_whole_server_startup(
     )
     with pytest.raises(OSError, match="second DP"):
         start_lwd_cloud_control_server(vllm_config)
+
+
+def _gateway_http_request(
+    request_id: str = "r",
+) -> tuple[dict[str, str], dict[str, Any]]:
+    manifest = _manifest(request_id)
+    headers = {**manifest.to_headers(), HEADER_EDGE_ID: "2"}
+    body = {
+        "model": "test-model",
+        "messages": manifest.to_messages(),
+        "stream": True,
+        "stream_options": {"include_usage": True},
+    }
+    return headers, body
+
+
+def _sse_frames(response: httpx.Response) -> list[str]:
+    return [frame for frame in response.text.split("\n\n") if frame]
+
+
+def _data_json(frame: str) -> dict[str, Any]:
+    assert frame.startswith("data: ")
+    return json.loads(frame.removeprefix("data: "))
+
+
+@pytest.mark.asyncio
+async def test_gateway_http_emits_contract_frames_and_real_usage(
+    bridge_factory: BridgeFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "vllm.v1.lwd_control.control_cloud_scheduler.lwd_gateway_control."
+        "_USAGE_HEARTBEAT_INTERVAL",
+        0.01,
+    )
+    bridge, command_queues, event_queue = bridge_factory(1)
+    app = create_lwd_gateway_control_app(bridge, cloud_id=0, dp_idx=0)
+    headers, body = _gateway_http_request()
+    expected = LwdUsage(prompt_tokens=16, completion_tokens=3, cached_tokens=16)
+
+    async def publish() -> None:
+        while command_queues[0].empty():
+            await asyncio.sleep(0)
+        command = command_queues[0].get_nowait()
+        assert "reserve" not in command
+        registration = bridge.registration("e2-r")
+        assert registration is not None
+        _reply(event_queue, command["reply_key"], 0, _result("e2-r", 1))
+        await asyncio.sleep(0.025)
+        nonce = registration.prefix_nonce
+        event_queue.put(
+            _usage_event("e2-r", expected, prefix_nonce=nonce, kind="usage_start")
+        )
+        event_queue.put(_usage_event("e2-r", expected, prefix_nonce=nonce))
+
+    publisher = asyncio.create_task(publish())
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://cloud"
+    ) as client:
+        response = await client.post("/v1/chat/completions", headers=headers, json=body)
+    await publisher
+
+    frames = _sse_frames(response)
+    startup = _data_json(frames[0])
+    assert startup["choices"][0]["delta"]["role"] == "assistant"
+    assert startup["choices"][0]["finish_reason"] is None
+    control = json.loads(startup["choices"][0]["delta"]["content"])
+    assert control["cloud_id"] == 0
+    assert control["engine_index"] == 0
+    assert control["prefix_nonce"] > 0
+    assert frames[1].startswith("data: ")
+    assert _data_json(frames[1])["choices"] == [
+        {"index": 0, "delta": {}, "finish_reason": None}
+    ]
+    assert ": edge-cloud-usage-pending" in frames
+    usage_chunk = _data_json(frames[-2])
+    assert usage_chunk["choices"] == []
+    assert usage_chunk["usage"] == expected.to_openai_dict()
+    assert frames[-1] == "data: [DONE]"
+    assert bridge.registration("e2-r") is None
+
+
+@pytest.mark.asyncio
+async def test_gateway_usage_exception_ends_with_unavailable_not_disconnect(
+    bridge_factory: BridgeFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bridge, command_queues, event_queue = bridge_factory(1)
+    app = create_lwd_gateway_control_app(bridge, cloud_id=0, dp_idx=0)
+    headers, body = _gateway_http_request()
+
+    async def fail_wait(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("usage waiter failed")
+
+    monkeypatch.setattr(bridge, "wait_gateway_usage", fail_wait)
+
+    async def publish_probe() -> None:
+        while command_queues[0].empty():
+            await asyncio.sleep(0)
+        command = command_queues[0].get_nowait()
+        _reply(event_queue, command["reply_key"], 0, _result("e2-r", 1))
+
+    publisher = asyncio.create_task(publish_probe())
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://cloud"
+    ) as client:
+        response = await client.post("/v1/chat/completions", headers=headers, json=body)
+    await publisher
+
+    assert response.status_code == 200
+    assert _sse_frames(response)[-2:] == [
+        ": edge-cloud-usage-unavailable",
+        "data: [DONE]",
+    ]
+    assert '"usage":' not in response.text
+
+
+@pytest.mark.asyncio
+async def test_gateway_probe_timeout_releases_usage_registration(
+    bridge_factory: BridgeFactory,
+) -> None:
+    bridge, command_queues, _ = bridge_factory(1)
+    app = create_lwd_gateway_control_app(
+        bridge, cloud_id=0, dp_idx=0, probe_timeout=0.01
+    )
+    headers, body = _gateway_http_request()
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://cloud"
+    ) as client:
+        response = await client.post("/v1/chat/completions", headers=headers, json=body)
+
+    assert response.status_code == 503
+    assert bridge.registration("e2-r") is None
+    assert command_queues[0].get_nowait()["type"] == "probe"
+
+
+@pytest.mark.asyncio
+async def test_gateway_rejects_extra_body_fields_and_does_not_mix_direct_routes(
+    bridge_factory: BridgeFactory,
+) -> None:
+    bridge, command_queues, _ = bridge_factory(1)
+    gateway_app = create_lwd_gateway_control_app(bridge, cloud_id=0, dp_idx=0)
+    direct_app = create_lwd_cloud_control_app(bridge, cloud_id=0, dp_idx=0)
+    headers, body = _gateway_http_request()
+    body["max_tokens"] = 1
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=gateway_app), base_url="http://cloud"
+    ) as client:
+        rejected = await client.post("/v1/chat/completions", headers=headers, json=body)
+        direct = await client.post("/v1/lwd/probe", headers=headers, json=body)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=direct_app), base_url="http://cloud"
+    ) as client:
+        gateway = await client.post("/v1/chat/completions", headers=headers, json=body)
+
+    assert rejected.status_code == 400
+    assert direct.status_code == 404
+    assert gateway.status_code == 404
+    assert command_queues[0].empty()
+
+
+@pytest.mark.asyncio
+async def test_gateway_wrong_dp_usage_settles_as_unavailable(
+    bridge_factory: BridgeFactory,
+) -> None:
+    bridge, _, event_queue = bridge_factory(2)
+    registration = bridge.activate("gateway-route", 1)
+    usage = LwdUsage(prompt_tokens=16, completion_tokens=1, cached_tokens=0)
+    event_queue.put(
+        _usage_event(
+            "gateway-route",
+            usage,
+            engine_index=0,
+            prefix_nonce=registration.prefix_nonce,
+        )
+    )
+
+    assert (
+        await bridge.wait_gateway_usage(
+            "gateway-route", admission_timeout=1, registration=registration
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_gateway_wait_has_independent_execution_timeout(
+    bridge_factory: BridgeFactory,
+) -> None:
+    bridge, _, event_queue = bridge_factory(1)
+    registration = bridge.activate("gateway-long", 0)
+    expected = LwdUsage(prompt_tokens=16, completion_tokens=4, cached_tokens=8)
+    event_queue.put(
+        _usage_event(
+            "gateway-long",
+            expected,
+            prefix_nonce=registration.prefix_nonce,
+            kind="usage_start",
+        )
+    )
+    await asyncio.sleep(0.02)
+    waiter = asyncio.create_task(
+        bridge.wait_gateway_usage(
+            "gateway-long",
+            admission_timeout=0.01,
+            execution_timeout=1,
+            registration=registration,
+        )
+    )
+    await asyncio.sleep(0.02)
+    assert not waiter.done()
+    event_queue.put(
+        _usage_event("gateway-long", expected, prefix_nonce=registration.prefix_nonce)
+    )
+    assert await waiter is expected
+
+
+@pytest.mark.asyncio
+async def test_gateway_admission_and_execution_timeouts_release_registration(
+    bridge_factory: BridgeFactory,
+) -> None:
+    bridge, _, event_queue = bridge_factory(1)
+    registration = bridge.activate("gateway-admission", 0)
+    assert (
+        await bridge.wait_gateway_usage(
+            "gateway-admission",
+            admission_timeout=0.01,
+            registration=registration,
+        )
+        is None
+    )
+    assert bridge.registration("gateway-admission") is None
+
+    registration = bridge.activate("gateway-execution", 0)
+    usage = LwdUsage(prompt_tokens=16, completion_tokens=4, cached_tokens=8)
+    event_queue.put(
+        _usage_event(
+            "gateway-execution",
+            usage,
+            prefix_nonce=registration.prefix_nonce,
+            kind="usage_start",
+        )
+    )
+    assert (
+        await bridge.wait_gateway_usage(
+            "gateway-execution",
+            execution_timeout=0.01,
+            registration=registration,
+        )
+        is None
+    )
+    assert bridge.registration("gateway-execution") is None
+
+
+@pytest.mark.asyncio
+async def test_gateway_forwards_request_execution_timeout(
+    bridge_factory: BridgeFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bridge, command_queues, event_queue = bridge_factory(1)
+    app = create_lwd_gateway_control_app(bridge, cloud_id=0, dp_idx=0)
+    headers, body = _gateway_http_request()
+    headers[HEADER_USAGE_EXECUTION_TIMEOUT_MS] = "999000"
+    expected = LwdUsage(prompt_tokens=16, completion_tokens=3, cached_tokens=16)
+    observed: dict[str, Any] = {}
+
+    async def fake_wait(request_id: str, **kwargs: Any) -> LwdUsage:
+        observed["request_id"] = request_id
+        observed.update(kwargs)
+        return expected
+
+    monkeypatch.setattr(bridge, "wait_gateway_usage", fake_wait)
+
+    async def publish_probe() -> None:
+        while command_queues[0].empty():
+            await asyncio.sleep(0)
+        command = command_queues[0].get_nowait()
+        _reply(event_queue, command["reply_key"], 0, _result("e2-r", 1))
+
+    publisher = asyncio.create_task(publish_probe())
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://cloud"
+    ) as client:
+        response = await client.post("/v1/chat/completions", headers=headers, json=body)
+    await publisher
+
+    assert response.status_code == 200
+    assert observed["request_id"] == "e2-r"
+    assert observed["execution_timeout"] == 999.0
+    assert expected.to_openai_dict() == _data_json(_sse_frames(response)[-2])["usage"]
+
+
+@pytest.mark.asyncio
+async def test_gateway_rejects_zero_request_execution_timeout(
+    bridge_factory: BridgeFactory,
+) -> None:
+    bridge, command_queues, _ = bridge_factory(1)
+    app = create_lwd_gateway_control_app(bridge, cloud_id=0, dp_idx=0)
+    headers, body = _gateway_http_request()
+    headers[HEADER_USAGE_EXECUTION_TIMEOUT_MS] = "0"
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://cloud"
+    ) as client:
+        response = await client.post("/v1/chat/completions", headers=headers, json=body)
+
+    assert response.status_code == 400
+    assert command_queues[0].empty()
+    assert bridge.registration("e2-r") is None

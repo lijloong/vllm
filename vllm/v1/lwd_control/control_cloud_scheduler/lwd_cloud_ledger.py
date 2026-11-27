@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     )
 
 _LWD_RETIRED_ROUTE_CAP = 4096
+_LWD_RETIRED_PENDING_ADD_CAP = 4096
 
 
 class LwdCloudLedger:
@@ -49,6 +50,12 @@ class LwdCloudLedger:
         """Canonical request id -> originating edge peer."""
         self.retired_routes: dict[str, LwdPeer] = {}
         """Bounded route tombstones for DOWN metadata trailing retirement."""
+        self.retired_pending_add: dict[str, int] = {}
+        """Request id -> generation nonce aborted while its ADD was still queued.
+
+        The abort can win the race against the matching ADD on the engine
+        thread; this tombstone lets the late ADD drop instead of resurrecting
+        a generation the edge already cancelled."""
         self.request_seqnos: dict[str, set[int]] = {}
         """Request id -> seqnos still pending on its connection."""
         self.pending_seqnos: dict[LwdConnectionId, dict[int, set[str]]] = {}
@@ -125,3 +132,28 @@ class LwdCloudLedger:
         self.request_nonces.pop(request_id, None)
         self.request_seqnos.pop(request_id, None)
         self.prompt_lens.pop(request_id, None)
+
+    def retire_pending_add(self, request_id: str, nonce: int) -> None:
+        """Remember that `request_id`'s generation `nonce` was aborted while
+        its ADD may still be queued on the engine thread."""
+        self.retired_pending_add[request_id] = nonce
+        # Bound the map like retired_routes. A live entry here is always freed
+        # by its queued ADD, so this only caps pathological residue.
+        while len(self.retired_pending_add) > _LWD_RETIRED_PENDING_ADD_CAP:
+            self.retired_pending_add.pop(next(iter(self.retired_pending_add)))
+
+    def consume_stale_add(self, request_id: str, nonce: int) -> bool:
+        """Drop an ADD whose generation was retired before it was consumed.
+
+        Returns True (releasing the tombstone) when `request_id`'s `nonce`
+        generation was aborted ahead of this queued ADD. A live generation, or
+        one that never completed RequestNotify, returns False.
+        """
+        tombstone = self.retired_pending_add.get(request_id)
+        if tombstone is None:
+            return False
+        # FIFO guarantees an older generation's queued ADD was already consumed
+        # ahead of this one, so releasing the same id here is safe: a mismatched
+        # nonce is a fresh generation (admit) and a match is a stale ADD (drop).
+        self.retired_pending_add.pop(request_id, None)
+        return tombstone == nonce

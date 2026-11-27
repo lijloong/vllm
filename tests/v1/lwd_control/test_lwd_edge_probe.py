@@ -5,6 +5,7 @@ import asyncio
 import threading
 import time
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import Mock
 
 import pytest
@@ -16,6 +17,12 @@ from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_engine import (
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_probe import (
     LwdEdgeProbeManager,
     LwdProbeSubmission,
+)
+from vllm.v1.lwd_control.control_edge_scheduler.lwd_gateway_activation import (
+    LwdGatewayActivationManager,
+)
+from vllm.v1.lwd_control.control_edge_scheduler.lwd_gateway_client import (
+    LwdGatewayActivation,
 )
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_probe_runtime import (
     LwdProbeRuntime,
@@ -66,6 +73,7 @@ def _request() -> SimpleNamespace:
         skip_reading_prefix_cache=False,
         prompt_token_ids=list(range(16)),
         num_prompt_tokens=16,
+        sampling_params=SimpleNamespace(max_tokens=32),
         mm_features=[],
     )
 
@@ -359,3 +367,130 @@ def test_admit_failure_cancels_unadmitted_usage_drain() -> None:
     engine._lwd_probe_manager.abort.assert_called_once_with("r")
     engine._lwd_probe_manager.mark_admitted.assert_not_called()
     engine.scheduler.lwd_edge_cancel_admission.assert_called_once_with("r")
+
+
+class _GatewayClient(_Client):
+    async def activate_gateway(
+        self, _session: object, request_id: str, _prompt: list[int], **kwargs: object
+    ) -> LwdGatewayActivation:
+        self.activity["max_tokens"] = cast(int, kwargs["max_tokens"])
+        self.calls.append((99, 99))
+        result = LwdProbeResult(
+            request_id=request_id,
+            instance_id="cloud-0",
+            block_size=4,
+            hit_blocks=1,
+            hit_tokens=4,
+            cloud_id=0,
+            engine_index=1,
+        )
+        return LwdGatewayActivation(
+            result=result,
+            prefix_nonce=9,
+            drain_task=asyncio.create_task(asyncio.sleep(60)),
+        )
+
+
+def _gateway_config() -> SimpleNamespace:
+    config = _config(True)
+    config.lwd_config.topology.gateway = SimpleNamespace(
+        enabled=True,
+        url="https://gateway.example.com/custom/v1/chat/completions",
+        connect_timeout=1.0,
+    )
+    return config
+
+
+def test_gateway_binds_returned_dp_without_edge_preselection() -> None:
+    manager = LwdGatewayActivationManager(_gateway_config(), lambda: None)
+    calls: list[tuple[int, int]] = []
+    activity = {"active": 0, "max_active": 0}
+    target = LwdConnectionId(0, 0, 1)
+    client = _GatewayClient(target, calls, activity)
+    manager._client = lambda _url, _block_size: client
+    try:
+        assert manager.submit(_request()) is LwdProbeSubmission.SUBMITTED
+        completion = _drain(manager, activated=True)
+        assert completion.connection_id == target
+        assert completion.result is not None
+        assert completion.result.engine_index == 1
+        assert completion.probe_nonce == 9
+        assert calls == [(99, 99)]
+        assert activity["max_tokens"] == 32
+
+        drain_task = manager._inflight["req"].drain_task
+        manager.abort("req")
+        assert not drain_task.done()
+        manager._runtime.cancel_task(drain_task)
+    finally:
+        manager.close()
+
+
+@pytest.mark.parametrize("sampling_params", [None, SimpleNamespace(max_tokens=None)])
+def test_gateway_missing_max_tokens_uses_lwd_default_for_usage_timeout(
+    sampling_params: SimpleNamespace | None,
+) -> None:
+    manager = LwdGatewayActivationManager(_gateway_config(), lambda: None)
+    activity: dict[str, int] = {}
+    client = _GatewayClient(LwdConnectionId(0, 0, 1), [], activity)
+    manager._client = lambda _url, _block_size: client
+    request = _request()
+    request.sampling_params = sampling_params
+    try:
+        assert manager.submit(request) is LwdProbeSubmission.SUBMITTED
+        _drain(manager, activated=True)
+        assert activity["max_tokens"] == 16
+    finally:
+        manager.close()
+
+
+def test_gateway_rejects_ambiguous_or_mismatched_identity() -> None:
+    manager = LwdGatewayActivationManager(_gateway_config(), lambda: None)
+    base = LwdProbeResult(
+        request_id="req",
+        instance_id="cloud-0",
+        block_size=4,
+        hit_blocks=0,
+        hit_tokens=0,
+        cloud_id=None,
+        engine_index=None,
+    )
+    with pytest.raises(RuntimeError, match="engine_index"):
+        manager._resolve_connection(base, edge_id=0)
+
+    config = _gateway_config()
+    config.lwd_config.connections = [
+        _connection(0, 0, 0),
+        _connection(0, 1, 0),
+    ]
+    multi_cloud = LwdGatewayActivationManager(config, lambda: None)
+    with pytest.raises(RuntimeError, match="cloud_id"):
+        multi_cloud._resolve_connection(base, edge_id=0)
+
+    wrong_instance = LwdProbeResult(
+        request_id="req",
+        instance_id="cloud-1",
+        block_size=4,
+        hit_blocks=0,
+        hit_tokens=0,
+        cloud_id=0,
+        engine_index=0,
+    )
+    with pytest.raises(RuntimeError, match="different instance"):
+        manager._resolve_connection(wrong_instance, edge_id=0)
+
+
+def test_gateway_submit_failure_returns_failed_and_cleans_inflight() -> None:
+    class _StoppedRuntime:
+        def submit(self, _coroutine, *, timeout=None):
+            raise RuntimeError("event loop stopped")
+
+        def stop(self) -> None:
+            pass
+
+    manager = LwdGatewayActivationManager(_gateway_config(), lambda: None)
+    manager._runtime = _StoppedRuntime()
+
+    assert manager.submit(_request()) is LwdProbeSubmission.FAILED
+    assert not manager._inflight
+    manager.close()
