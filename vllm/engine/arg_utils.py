@@ -1813,7 +1813,7 @@ class EngineArgs:
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
-        from vllm.v1.lwd_control.lwd_tokenizer_obfuscation import run_obfuscation_hook
+        from vllm.tokenizers.lwd_tokenizer_obfuscation import run_obfuscation_hook
 
         # Obfuscation options arrive inside --additional-config; lift them
         # before the hook so configure_server_args sees the resolved fields.
@@ -2107,7 +2107,7 @@ class EngineArgs:
                 )
             )
 
-        from vllm.v1.lwd_control.lwd_tokenizer_obfuscation import run_obfuscation_hook
+        from vllm.tokenizers.lwd_tokenizer_obfuscation import run_obfuscation_hook
 
         # Bind the tokenizer before ModelConfig/ReasoningConfig can initialize
         # tokenizers. The final hook below checks native resolved defaults.

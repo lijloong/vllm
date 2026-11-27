@@ -116,7 +116,7 @@ class StructuredOutputManager:
         if request.structured_output_request is None:
             return
 
-        from vllm.v1.lwd_control.lwd_tokenizer_obfuscation import (
+        from vllm.tokenizers.lwd_tokenizer_obfuscation import (
             confirm_structured_output_backend_route,
             prepare_structured_output_backend_route,
         )

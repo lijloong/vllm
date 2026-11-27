@@ -39,7 +39,7 @@ async def build_async_engine_client(
     usage_context: UsageContext = UsageContext.OPENAI_API_SERVER,
     client_config: dict[str, Any] | None = None,
 ) -> AsyncIterator[EngineClient]:
-    from vllm.v1.lwd_control.lwd_tokenizer_obfuscation import run_obfuscation_hook
+    from vllm.tokenizers.lwd_tokenizer_obfuscation import run_obfuscation_hook
 
     # Bind artifact environment before a forkserver snapshots this process.
     # This also covers callers that construct the client without setup_server.
