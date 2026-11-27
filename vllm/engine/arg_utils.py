@@ -84,7 +84,11 @@ from vllm.config.kernel import (
 )
 from vllm.config.load import SafetensorsLoadStrategy
 from vllm.config.lora import MaxLoRARanks
-from vllm.config.lwd import LwdAPIConfig, resolve_lwd_config
+from vllm.config.lwd import (
+    LwdAPIConfig,
+    apply_obfuscation_additional_config,
+    resolve_lwd_config,
+)
 from vllm.config.mamba import MambaBackendEnum, MambaSSUAlgorithm
 from vllm.config.model import (
     ConvertOption,
@@ -803,10 +807,6 @@ class EngineArgs:
         # support `EngineArgs(compilation_config={...})`
         # without having to manually construct a
         # CompilationConfig object
-        from vllm.v1.lwd_control.lwd_tokenizer_obfuscation import (
-            apply_obfuscation_additional_config,
-        )
-
         # Programmatic (non-CLI) startup reads the same --additional-config
         # block; from_cli_args already lifted it for the serve path.
         apply_obfuscation_additional_config(self)
@@ -1813,10 +1813,7 @@ class EngineArgs:
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
-        from vllm.v1.lwd_control.lwd_tokenizer_obfuscation import (
-            apply_obfuscation_additional_config,
-            run_obfuscation_hook,
-        )
+        from vllm.v1.lwd_control.lwd_tokenizer_obfuscation import run_obfuscation_hook
 
         # Obfuscation options arrive inside --additional-config; lift them
         # before the hook so configure_server_args sees the resolved fields.
