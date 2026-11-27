@@ -1079,7 +1079,7 @@ class SamplingParams(
     ) -> None:
         if structured_outputs_config is None or self.structured_outputs is None:
             return
-        from vllm.utils.tokenizer_obfuscation import (
+        from vllm.v1.lwd_control.lwd_tokenizer_obfuscation import (
             validate_structured_outputs_with_route,
         )
 

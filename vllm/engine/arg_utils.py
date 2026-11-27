@@ -1826,7 +1826,7 @@ class EngineArgs:
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
-        from vllm.utils.tokenizer_obfuscation import run_obfuscation_hook
+        from vllm.v1.lwd_control.lwd_tokenizer_obfuscation import run_obfuscation_hook
 
         # Frontend-only tool and middleware settings must be resolved before
         # copying the engine fields and before API workers are spawned.
@@ -2117,7 +2117,7 @@ class EngineArgs:
                 )
             )
 
-        from vllm.utils.tokenizer_obfuscation import run_obfuscation_hook
+        from vllm.v1.lwd_control.lwd_tokenizer_obfuscation import run_obfuscation_hook
 
         # Bind the tokenizer before ModelConfig/ReasoningConfig can initialize
         # tokenizers. The final hook below checks native resolved defaults.
