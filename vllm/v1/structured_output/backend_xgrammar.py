@@ -45,22 +45,31 @@ class XgrammarBackend(StructuredOutputBackend):
             self.num_speculative_tokens = (
                 self.vllm_config.speculative_config.num_speculative_tokens
             )
-        self.tokenizer_backend_adapter = None
-        if callable(
-            init_backend := getattr(self.tokenizer, "init_xgrammar_backend", None)
-        ):
-            # A custom tokenizer may expose transport characters instead of its
-            # actual token bytes. Let it supply RAW TokenizerInfo and apply its
-            # admission policy before a Matcher is published.
-            self.tokenizer_backend_adapter = init_backend(
+        self._init_tokenizer_backend_adapter()
+        self.compiler = self._create_compiler(self._resolve_tokenizer_info())
+
+    def _init_tokenizer_backend_adapter(self) -> None:
+        """Bind the custom-tokenizer adapter exposed for this backend.
+
+        A custom tokenizer may expose transport characters instead of its
+        actual token bytes. Its adapter supplies RAW TokenizerInfo and applies
+        the admission policy before a Matcher is published.
+        """
+        init_backend = getattr(self.tokenizer, "init_xgrammar_backend", None)
+        self.tokenizer_backend_adapter = (
+            init_backend(
                 self.vocab_size,
                 disable_any_whitespace=self.disable_any_whitespace,
                 num_speculative_tokens=self.num_speculative_tokens,
             )
+            if callable(init_backend)
+            else None
+        )
 
+    def _resolve_tokenizer_info(self) -> "xgr.TokenizerInfo":
         if self.tokenizer_backend_adapter is not None:
-            tokenizer_info = self.tokenizer_backend_adapter.tokenizer_info
-        elif is_mistral_tokenizer(self.tokenizer):
+            return self.tokenizer_backend_adapter.tokenizer_info
+        if is_mistral_tokenizer(self.tokenizer):
             # NOTE: ideally, xgrammar should handle this accordingly.
             # refer to https://github.com/mlc-ai/xgrammar/blob/d77c0a0173ef14779c918e3be7966ba852f7910f/python/xgrammar/tokenizer_info.py#L98
             stop_token_ids = [self.tokenizer.eos_token_id]
@@ -68,7 +77,7 @@ class XgrammarBackend(StructuredOutputBackend):
             # not self.tokenizer.vocab_size as self.tokenizer.vocab
             # collapses all decoded errors into a single token.
             self.vocab_size = len(self.tokenizer.vocab)
-            tokenizer_info = xgr.TokenizerInfo(  # type: ignore
+            return xgr.TokenizerInfo(  # type: ignore
                 encoded_vocab=self.tokenizer.vocab,
                 # NOTE: https://github.com/mlc-ai/xgrammar/blob/5e141f6ff1ca02bc31f9e512e68b61f2a8ae88e5/tests/python/test_tokenizer_info.py#L43 # noqa: E501
                 vocab_type=xgr.VocabType.RAW
@@ -78,27 +87,31 @@ class XgrammarBackend(StructuredOutputBackend):
                 stop_token_ids=stop_token_ids,
                 add_prefix_space=True,
             )
-        else:
-            tokenizer_info = xgr.TokenizerInfo.from_huggingface(
-                self.tokenizer,
-                vocab_size=self.vocab_size,
-            )
-        compiler_options = {
-            "max_threads": 8,
-            "cache_enabled": True,
-            "cache_limit_bytes": vllm.envs.VLLM_XGRAMMAR_CACHE_MB * 1024 * 1024,
-        }
-        if self.tokenizer_backend_adapter is not None:
-            compiler_options = self.tokenizer_backend_adapter.compiler_options
-        create_compiler = getattr(
-            self.tokenizer_backend_adapter, "create_compiler", None
+        return xgr.TokenizerInfo.from_huggingface(
+            self.tokenizer,
+            vocab_size=self.vocab_size,
         )
-        if callable(create_compiler):
-            # The adapter creates the compiler from its privately validated TI,
-            # so returned artifacts carry provenance without rescanning vocab.
-            self.compiler = create_compiler()
+
+    def _create_compiler(
+        self, tokenizer_info: "xgr.TokenizerInfo"
+    ) -> "xgr.GrammarCompiler":
+        if self.tokenizer_backend_adapter is not None:
+            create_compiler = getattr(
+                self.tokenizer_backend_adapter, "create_compiler", None
+            )
+            if callable(create_compiler):
+                # The adapter creates the compiler from its privately validated
+                # TI, so returned artifacts carry provenance without rescanning
+                # vocab.
+                return create_compiler()
+            compiler_options = self.tokenizer_backend_adapter.compiler_options
         else:
-            self.compiler = xgr.GrammarCompiler(tokenizer_info, **compiler_options)
+            compiler_options = {
+                "max_threads": 8,
+                "cache_enabled": True,
+                "cache_limit_bytes": vllm.envs.VLLM_XGRAMMAR_CACHE_MB * 1024 * 1024,
+            }
+        return xgr.GrammarCompiler(tokenizer_info, **compiler_options)
 
     def compile_grammar(
         self,
