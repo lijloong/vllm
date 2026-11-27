@@ -65,6 +65,10 @@ from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
     lwd_encode_reasoning_parser_kwargs,
     lwd_encode_structured_outputs,
 )
+from vllm.v1.lwd_control.lwd_comm.lwd_mm_identity import (
+    compute_processor_fingerprint,
+    mm_abi_header_value,
+)
 from vllm.v1.request import Request
 
 # Native batch queue depth: dispatched (embed + unembed) batches not yet
@@ -95,6 +99,21 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
     lwd_scheduler_cls = LwdEdgeScheduler
     scheduler: LwdEdgeScheduler
 
+    def _lwd_prepare(self, vllm_config: Any) -> None:
+        # Hash the MM identity pre-worker, like the cloud front-end does:
+        # Ascend model construction normalizes hf_config in place.
+        self._lwd_processor_fingerprint: bytes | None = None
+        coordination = vllm_config.lwd_config.coordination
+        if coordination is None or not coordination.enabled:
+            return
+        fingerprint = compute_processor_fingerprint(vllm_config.model_config)
+        lwd_logger.info(
+            "[mm-abi] role=edge instance_id=%s fingerprint=%s",
+            vllm_config.lwd_config.instance_id,
+            mm_abi_header_value(fingerprint),
+        )
+        self._lwd_processor_fingerprint = fingerprint
+
     def _lwd_assemble(self) -> None:
         self._lwd_prefix_enabled = bool(
             self.vllm_config.cache_config.enable_prefix_caching
@@ -117,6 +136,7 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         self._lwd_probe_manager = manager_cls(
             self.vllm_config,
             lambda: self.input_queue.put_nowait((EngineCoreRequestType.WAKEUP, None)),
+            processor_fingerprint=self._lwd_processor_fingerprint,
         )
         self._lwd_probe_chains: dict[str, list[bytes]] = {}
         self.scheduler.lwd_on_finish = self._lwd_finish_request
