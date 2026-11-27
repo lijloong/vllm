@@ -807,11 +807,13 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             records.items()
         ):
             cached_tokens = self._lwd_ledger.prefix_hits.get(request_id, 0)
-            usage = LwdUsage(
-                prompt_tokens=prompt_tokens,
-                completion_tokens=completion_tokens,
-                cached_tokens=cached_tokens,
-            )
+            usage = None
+            if completion_tokens is not None:
+                usage = LwdUsage(
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    cached_tokens=cached_tokens,
+                )
             if event_queue is not None:
                 event_queue.put(
                     {

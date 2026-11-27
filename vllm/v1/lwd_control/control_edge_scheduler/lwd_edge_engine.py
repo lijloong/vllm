@@ -43,6 +43,9 @@ from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_probe import (
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_scheduler import (
     LwdEdgeScheduler,
 )
+from vllm.v1.lwd_control.control_edge_scheduler.lwd_gateway_activation import (
+    LwdGatewayActivationManager,
+)
 from vllm.v1.lwd_control.control_scheduler.lwd_base_engine import (
     LwdBaseEngineCore,
 )
@@ -102,7 +105,16 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             else None
         )
         self._lwd_cloud_params: dict[LwdConnectionId, LwdCloudParamsNotify] = {}
-        self._lwd_probe_manager = LwdEdgeProbeManager(
+        gateway = self.lwd_config.topology.gateway
+        lwd_logger.info(
+            "[LWD] coordination mode=%s gateway_url=%s",
+            "gateway" if gateway.enabled else "direct",
+            gateway.url if gateway.enabled else "-",
+        )
+        manager_cls = (
+            LwdGatewayActivationManager if gateway.enabled else LwdEdgeProbeManager
+        )
+        self._lwd_probe_manager = manager_cls(
             self.vllm_config,
             lambda: self.input_queue.put_nowait((EngineCoreRequestType.WAKEUP, None)),
         )
@@ -299,7 +311,10 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             control.add_request(request)
             return
         submission = self._lwd_probe_manager.submit(request)
-        if submission is not LwdProbeSubmission.UNAVAILABLE:
+        if submission is LwdProbeSubmission.SUBMITTED:
+            return
+        if submission is LwdProbeSubmission.FAILED:
+            self._lwd_abort_internally(request)
             return
         self._lwd_add_request_after_probe(request)
 
@@ -419,7 +434,10 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
                     ),
                     None,
                 )
-                if not self._lwd_probe_manager.activate(completion, target, candidate):
+                manager = self._lwd_probe_manager
+                if isinstance(manager, LwdEdgeProbeManager) and not manager.activate(
+                    completion, target, candidate
+                ):
                     lwd_logger.warning(
                         "[edge-probe] stale activation req=%s ignored",
                         completion.request.request_id,

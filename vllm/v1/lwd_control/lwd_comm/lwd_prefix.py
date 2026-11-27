@@ -26,6 +26,7 @@ import pybase64 as base64
 PROTOCOL_VERSION = "edge-cloud-prefix-v1"
 PROTOCOL_VERSION_MM = "edge-cloud-prefix-v2"
 PROBE_HEADROOM_S = 5.0
+GATEWAY_USAGE_EXECUTION_TIMEOUT_S = 600.0
 BLOCK_HASH_PREFIX = "ecb1:"
 TAIL_HASH_PREFIX = "ec" + "t1:"
 DIGEST_SIZE = hashlib.sha256().digest_size
@@ -43,6 +44,7 @@ HEADER_CLOUD_ID = "X-Edge-Cloud-Cloud-Id"
 HEADER_PROMPT_TOKENS = "X-Edge-Cloud-Prompt-Tokens"
 HEADER_ENGINE_INDEX = "X-Edge-Cloud-Engine-Index"
 HEADER_PROBE_NONCE = "X-Lwd-Probe-Nonce"
+HEADER_USAGE_EXECUTION_TIMEOUT_MS = "X-Lwd-Usage-Execution-Timeout-Ms"
 
 _PROBE_RESULT_HEADERS = {
     "request_id": HEADER_REQUEST_ID,
@@ -439,9 +441,9 @@ class LwdProbeResult:
     # Cloud ID in the routing reply: filled by the central scheduler/gateway
     # for multi-cloud routing; None means one cloud or routing disabled.
     cloud_id: int | None = None
-    # Cloud-local DP placement. The new direct-DP protocol always serializes
-    # this field, including zero.
-    engine_index: int = 0
+    # Cloud-local DP placement. None means unknown until the direct listener
+    # or gateway startup message identifies the serving DP.
+    engine_index: int | None = None
 
     def __post_init__(self) -> None:
         if not self.request_id or not self.instance_id:
@@ -452,7 +454,7 @@ class LwdProbeResult:
             raise ValueError("hit_tokens must equal hit_blocks * block_size")
         if self.alignment_tokens < 0:
             raise ValueError("alignment_tokens must not be negative")
-        if self.engine_index < 0:
+        if self.engine_index is not None and self.engine_index < 0:
             raise ValueError("engine_index must not be negative")
 
     def _wire_fields(self) -> dict[str, Any]:
@@ -463,8 +465,9 @@ class LwdProbeResult:
             "hit_blocks": self.hit_blocks,
             "hit_tokens": self.hit_tokens,
             "alignment_tokens": self.alignment_tokens,
-            "engine_index": self.engine_index,
         }
+        if self.engine_index is not None:
+            fields["engine_index"] = self.engine_index
         if self.cloud_id is not None:
             fields["cloud_id"] = self.cloud_id
         return fields
@@ -494,6 +497,18 @@ class LwdProbeResult:
 
     @classmethod
     def from_control_message(cls, message: Mapping[str, Any]) -> LwdProbeResult:
+        """Validate a direct-DP probe payload with explicit DP identity."""
+        return cls._from_control_message(message, require_identity=True)
+
+    @classmethod
+    def from_gateway_control_message(cls, message: Mapping[str, Any]) -> LwdProbeResult:
+        """Validate a gateway payload, allowing unambiguous identity inference."""
+        return cls._from_control_message(message, require_identity=False)
+
+    @classmethod
+    def _from_control_message(
+        cls, message: Mapping[str, Any], *, require_identity: bool
+    ) -> LwdProbeResult:
         """Validate the probe payload from an SSE delta.content JSON object."""
         if message.get("type") != "edge_cloud_probe":
             raise ValueError("expected an edge_cloud_probe control message")
@@ -504,10 +519,16 @@ class LwdProbeResult:
             if type(message.get(name)) is not int:
                 raise ValueError(f"probe {name} must be an integer")
         cloud_id = message.get("cloud_id")
-        if type(cloud_id) is not int or cloud_id < 0:
+        if cloud_id is None and require_identity:
+            raise ValueError("probe cloud_id is required")
+        if cloud_id is not None and (type(cloud_id) is not int or cloud_id < 0):
             raise ValueError("probe cloud_id must be a non-negative integer")
         engine_index = message.get("engine_index")
-        if type(engine_index) is not int or engine_index < 0:
+        if engine_index is None and require_identity:
+            raise ValueError("probe engine_index is required")
+        if engine_index is not None and (
+            type(engine_index) is not int or engine_index < 0
+        ):
             raise ValueError("probe engine_index must be a non-negative integer")
         alignment_tokens = message.get("alignment_tokens", 0)
         if type(alignment_tokens) is not int or alignment_tokens < 0:
@@ -525,6 +546,7 @@ class LwdProbeResult:
 
     @classmethod
     def from_headers(cls, headers: Mapping[str, str]) -> LwdProbeResult:
+        """Parse direct-DP headers; gateway handshakes use content instead."""
         values = {k.lower(): v for k, v in headers.items()}
 
         def required(name: str) -> str:

@@ -32,6 +32,7 @@ logger = init_logger(__name__)
 class LwdProbeSubmission(Enum):
     SUBMITTED = "submitted"
     UNAVAILABLE = "unavailable"
+    FAILED = "failed"
 
 
 @dataclass(frozen=True)

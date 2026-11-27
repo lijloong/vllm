@@ -418,6 +418,76 @@ def test_coord_url_is_derived_and_available_on_every_connection() -> None:
         assert cloud.coord_port == 8100 + cloud.dp_idx
 
 
+def test_explicit_gateway_uses_complete_url_and_shared_topology_mode() -> None:
+    raw = cloud_reuse(1)
+    raw["gateway"] = {
+        "enabled": True,
+        "url": "https://gateway.example.com/custom/cloud?route=blue",
+        "connect_timeout": 3.0,
+    }
+    topology = LwdTopology.from_dict(raw)
+    assert topology.gateway.enabled
+    assert topology.gateway.url == raw["gateway"]["url"]
+    assert topology.gateway.connect_timeout == 3.0
+
+
+def test_disabled_or_omitted_gateway_keeps_direct_configuration() -> None:
+    omitted = cloud_reuse(1)
+    disabled = cloud_reuse(1)
+    disabled["gateway"] = {
+        "enabled": False,
+        "url": "https://gateway.example.com/custom/v1/chat/completions",
+    }
+    assert not LwdTopology.from_dict(omitted).gateway.enabled
+    parsed = LwdTopology.from_dict(disabled)
+    assert not parsed.gateway.enabled
+    assert parsed.clouds[0].dp[0].coord_url == "http://10.1.0.1:8100"
+
+
+def test_enabled_gateway_requires_coordination_on_every_instance() -> None:
+    raw = topology_payload("s1_single_instance_1dp.yaml")
+    raw["gateway"] = {
+        "enabled": True,
+        "url": "https://gateway.example.com/v1/chat/completions",
+    }
+    with pytest.raises(
+        ValueError, match="enabled gateway requires enabled coordination"
+    ):
+        LwdTopology.from_dict(raw)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "ftp://gateway.example.com/v1/chat/completions",
+        "https://gateway.example.com",
+        "https://gateway.example.com/",
+        "https://user:secret@gateway.example.com/v1/chat/completions",
+        "https://gateway.example.com/v1/chat/completions#fragment",
+        "https://gateway.example.com/v1/chat completions",
+    ],
+)
+def test_gateway_rejects_incomplete_or_invalid_url(url: str) -> None:
+    raw = cloud_reuse(1)
+    raw["gateway"] = {"enabled": True, "url": url}
+    with pytest.raises(ValueError, match="gateway"):
+        LwdTopology.from_dict(raw)
+
+
+def test_gateway_requires_url_and_rejects_legacy_urls_and_path() -> None:
+    raw = cloud_reuse(1)
+    url = "https://gateway.example.com/v1/chat/completions"
+    raw["gateway"] = {"enabled": True}
+    with pytest.raises(ValueError, match="requires a URL"):
+        LwdTopology.from_dict(raw)
+    raw["gateway"] = {"enabled": True, "urls": [url]}
+    with pytest.raises(ValueError):
+        LwdTopology.from_dict(raw)
+    raw["gateway"] = {"enabled": True, "url": url, "path": "/ignored"}
+    with pytest.raises(ValueError):
+        LwdTopology.from_dict(raw)
+
+
 def test_probe_poll_budget_yaml_config() -> None:
     raw = topology_payload("s1_single_instance_1dp.yaml")
     coordination = raw["clouds"][0]["coordination"]

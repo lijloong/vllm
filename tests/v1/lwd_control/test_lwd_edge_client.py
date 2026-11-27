@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
+import json
+import logging
 
 import pytest
 
@@ -9,9 +11,13 @@ from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_client import (
     LwdEdgePrefixClient,
     _iter_sse_data,
 )
+from vllm.v1.lwd_control.control_edge_scheduler.lwd_gateway_client import (
+    LwdGatewayClient,
+)
 from vllm.v1.lwd_control.lwd_comm.lwd_prefix import (
     HEADER_EDGE_ID,
     HEADER_PROBE_NONCE,
+    HEADER_USAGE_EXECUTION_TIMEOUT_MS,
 )
 
 
@@ -172,3 +178,158 @@ def test_completed_usage_drain_closes_response() -> None:
         assert not client._drain_tasks
 
     asyncio.run(run())
+
+
+def _content_chunk(content: str | None) -> bytes:
+    delta = {} if content is None else {"role": "assistant", "content": content}
+    chunk = {
+        "id": "req",
+        "object": "chat.completion.chunk",
+        "created": 1,
+        "model": "test",
+        "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
+    }
+    return f"data: {json.dumps(chunk)}\n\n".encode()
+
+
+def test_gateway_execution_timeout_adds_token_allowance_to_constant_base() -> None:
+    client = LwdGatewayClient(
+        "https://gateway.example.com/v1/chat/completions",
+        4,
+        b"tenant-key-16bytes",
+    )
+
+    assert client._usage_execution_timeout_ms(100) == 700000
+    assert client._usage_execution_timeout_ms(1200) == 1800000
+
+
+def test_gateway_posts_complete_url_and_recovers_fragmented_startup_content() -> None:
+    async def run() -> None:
+        control = {
+            **_probe_message(cloud_id=1, dp_idx=1),
+            "prefix_nonce": 9,
+        }
+        encoded = json.dumps(control, separators=(",", ":"))
+        response = _Response(b"")
+        response.content = _StreamingContent(
+            [
+                line
+                for event in [
+                    _content_chunk("gateway-injected-text"),
+                    _content_chunk(encoded[:20]),
+                    _content_chunk("not-json"),
+                    _content_chunk(encoded),
+                    _content_chunk(None),
+                    b"data: [DONE]\n\n",
+                ]
+                for line in event.splitlines(keepends=True)
+            ]
+        )
+        session = _Session(response)
+        url = "https://gateway.example.com/tenant-a/v1/chat/completions?route=blue"
+        client = LwdGatewayClient(url, 4, b"tenant-key-16bytes")
+
+        activation = await client.activate_gateway(
+            session,
+            "req",
+            list(range(8)),
+            edge_id=3,
+            model="test",
+            max_tokens=1200,
+        )
+        await activation.drain_task
+
+        assert activation.result.cloud_id == 1
+        assert activation.result.engine_index == 1
+        assert activation.prefix_nonce == 9
+        request_url, kwargs = session.calls[0]
+        assert request_url == url
+        assert set(kwargs["json"]) == {
+            "model",
+            "messages",
+            "stream",
+            "stream_options",
+        }
+        assert kwargs["json"]["stream"] is True
+        assert kwargs["json"]["stream_options"] == {"include_usage": True}
+        assert HEADER_PROBE_NONCE not in kwargs["headers"]
+        assert kwargs["headers"][HEADER_USAGE_EXECUTION_TIMEOUT_MS] == "1800000"
+        assert response.closed
+
+    asyncio.run(run())
+
+
+def test_gateway_activation_rejects_non_200_and_closes_response() -> None:
+    async def run() -> None:
+        response = _Response(b'{"error":"busy"}')
+        response.status = 503
+        session = _Session(response)
+        client = LwdGatewayClient(
+            "https://gateway.example.com/v1/chat/completions",
+            4,
+            b"tenant-key-16bytes",
+        )
+
+        with pytest.raises(RuntimeError, match="gateway activation HTTP 503"):
+            await client.activate_gateway(
+                session,
+                "req",
+                list(range(8)),
+                edge_id=3,
+                model="test",
+            )
+
+        assert response.closed
+
+    asyncio.run(run())
+
+
+def test_gateway_activation_startup_timeout_closes_response() -> None:
+    async def run() -> None:
+        response = _Response(b"")
+        response.content = _StreamingContent([], block=True)
+        session = _Session(response)
+        client = LwdGatewayClient(
+            "https://gateway.example.com/v1/chat/completions",
+            4,
+            b"tenant-key-16bytes",
+            probe_timeout=0.01,
+        )
+
+        with pytest.raises(asyncio.TimeoutError):
+            await client.activate_gateway(
+                session,
+                "req",
+                list(range(8)),
+                edge_id=3,
+                model="test",
+            )
+
+        assert response.closed
+
+    asyncio.run(run())
+
+
+def test_usage_unavailable_comment_accepts_sse_whitespace(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    async def run() -> None:
+        response = _Response(b"")
+        response.content = _StreamingContent(
+            [
+                b":edge-cloud-usage-unavailable \n",
+                b"\n",
+                b"data: [DONE]\n",
+                b"\n",
+            ]
+        )
+        client = LwdEdgePrefixClient("http://cloud1:8101", 4, b"tenant-key-16bytes")
+        task = client._start_drain("req", response, _iter_sse_data(response.content))
+
+        await task
+
+        assert response.closed
+
+    with caplog.at_level(logging.INFO):
+        asyncio.run(run())
+    assert "usage unavailable in stream" in caplog.text

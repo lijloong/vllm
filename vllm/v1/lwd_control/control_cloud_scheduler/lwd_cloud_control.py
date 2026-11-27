@@ -2,11 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
-"""Cloud-side direct-DP HTTP coordination.
+"""Cloud-side HTTP coordination.
 
-One bridge owns all per-DP command queues and the shared event queue. Each DP
-has a thin FastAPI listener: ``/v1/lwd/probe`` performs a short read-only peek,
-while ``/v1/lwd/activate`` registers usage before returning its SSE response.
+The direct mode exposes per-DP probe/activate routes. Explicit gateway mode
+uses the same bridge and listeners but serves the single-stream contract from
+``lwd_gateway_control``. One bridge owns all per-DP command queues and the
+shared event queue in both modes.
 """
 
 from __future__ import annotations
@@ -35,6 +36,7 @@ from vllm.v1.lwd_control.lwd_comm.lwd_mm_identity import (
     negotiate_lwd_protocol,
 )
 from vllm.v1.lwd_control.lwd_comm.lwd_prefix import (
+    GATEWAY_USAGE_EXECUTION_TIMEOUT_S,
     HEADER_CLOUD_ID,
     HEADER_EDGE_ID,
     HEADER_ENGINE_INDEX,
@@ -54,6 +56,7 @@ logger = init_logger(__name__)
 
 _USAGE_HEARTBEAT_INTERVAL = 10.0
 _USAGE_ADMISSION_TIMEOUT_S = 600.0
+_GATEWAY_USAGE_ADMISSION_TIMEOUT_S = 30.0
 _CLOUD_PROBE_POLL_BUDGET = 32
 _SERVER_START_TIMEOUT = 30.0
 _SERVER_STOP_TIMEOUT = 5.0
@@ -64,6 +67,7 @@ class _LwdUsageRegistration:
     engine_index: int
     prefix_nonce: int
     future: asyncio.Future[LwdUsage | None]
+    gateway: bool = False
     started: asyncio.Event = field(default_factory=asyncio.Event)
 
 
@@ -80,6 +84,7 @@ class LwdCloudControlBridge:
         self._event_queue = event_queue
         self._probe_futures: dict[str, tuple[int, asyncio.Future[LwdProbeResult]]] = {}
         self._usage_futures: dict[str, _LwdUsageRegistration] = {}
+        self._prefix_nonce = 0
         self._loop: asyncio.AbstractEventLoop | None = None
         self._lock = threading.Lock()
         self._closed = False
@@ -165,19 +170,24 @@ class LwdCloudControlBridge:
             raise
 
     def activate(
-        self, request_id: str, dp_idx: int, prefix_nonce: int
+        self, request_id: str, dp_idx: int, prefix_nonce: int | None = None
     ) -> _LwdUsageRegistration:
         """Register one DP/nonce usage generation before response headers."""
         loop = asyncio.get_running_loop()
+        gateway = prefix_nonce is None
         with self._lock:
             if self._closed:
                 raise RuntimeError("cloud control plane stopped")
             self._loop = loop
+            if prefix_nonce is None:
+                self._prefix_nonce += 1
+                prefix_nonce = self._prefix_nonce
             stale = self._usage_futures.pop(request_id, None)
             registration = _LwdUsageRegistration(
                 engine_index=dp_idx,
                 prefix_nonce=prefix_nonce,
                 future=loop.create_future(),
+                gateway=gateway,
             )
             self._usage_futures[request_id] = registration
         if stale is not None and not stale.future.done():
@@ -226,6 +236,46 @@ class LwdCloudControlBridge:
             return None
         finally:
             started_wait.cancel()
+            with self._lock:
+                if self._usage_futures.get(request_id) is registration:
+                    self._usage_futures.pop(request_id, None)
+
+    async def wait_gateway_usage(
+        self,
+        request_id: str,
+        *,
+        admission_timeout: float = _GATEWAY_USAGE_ADMISSION_TIMEOUT_S,
+        execution_timeout: float = GATEWAY_USAGE_EXECUTION_TIMEOUT_S,
+        registration: _LwdUsageRegistration,
+    ) -> LwdUsage | None:
+        """Bound gateway admission and started execution independently."""
+        with self._lock:
+            current = self._usage_futures.get(request_id)
+        if current is not registration:
+            return None
+        started_wait = asyncio.create_task(registration.started.wait())
+        waiters: set[asyncio.Future[Any]] = {registration.future, started_wait}
+        try:
+            completed, _ = await asyncio.wait(
+                waiters,
+                timeout=admission_timeout,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if registration.future in completed:
+                return registration.future.result()
+            if started_wait not in completed:
+                logger.warning("[LWD][ctrl] usage admission timeout req=%s", request_id)
+                return None
+            try:
+                return await asyncio.wait_for(
+                    registration.future, timeout=execution_timeout
+                )
+            except TimeoutError:
+                logger.warning("[LWD][ctrl] usage execution timeout req=%s", request_id)
+                return None
+        finally:
+            started_wait.cancel()
+            await asyncio.gather(started_wait, return_exceptions=True)
             with self._lock:
                 if self._usage_futures.get(request_id) is registration:
                     self._usage_futures.pop(request_id, None)
@@ -297,11 +347,21 @@ class LwdCloudControlBridge:
         if kind in ("usage_start", "usage"):
             with self._lock:
                 registration = self._usage_futures.get(request_id)
-            if (
-                registration is None
-                or registration.engine_index != event.get("engine_index")
-                or registration.prefix_nonce != event.get("prefix_nonce")
-            ):
+            if registration is None:
+                return
+            if registration.prefix_nonce != event.get("prefix_nonce"):
+                return
+            if registration.engine_index != event.get("engine_index"):
+                if registration.gateway:
+                    logger.error(
+                        "[LWD][ctrl] reject gateway usage from wrong DP req=%s "
+                        "expected=%d actual=%s",
+                        request_id,
+                        registration.engine_index,
+                        event.get("engine_index"),
+                    )
+                    if not registration.future.done():
+                        registration.future.set_result(None)
                 return
             if kind == "usage_start":
                 registration.started.set()
@@ -607,6 +667,8 @@ def start_lwd_cloud_control_server(
 ) -> tuple[list[Any] | None, Any | None]:
     """Start all DP listeners on one loop, or fail the cloud startup."""
     lwd_config = getattr(vllm_config, "lwd_config", None)
+    if lwd_config is None:
+        return None, None
     coord_cfg = getattr(lwd_config, "coordination", None)
     if coord_cfg is None or not coord_cfg.enabled or lwd_config.role != "cloud":
         return None, None
@@ -630,9 +692,17 @@ def start_lwd_cloud_control_server(
     bridge.start()
     cloud_probe_timeout = max(coord_cfg.probe_timeout - PROBE_HEADROOM_S, 1.0)
     fingerprint = compute_processor_fingerprint(vllm_config.model_config)
+    mode = "gateway" if lwd_config.topology.gateway.enabled else "direct"
+    app_factory = create_lwd_cloud_control_app
+    if lwd_config.topology.gateway.enabled:
+        from vllm.v1.lwd_control.control_cloud_scheduler.lwd_gateway_control import (
+            create_lwd_gateway_control_app,
+        )
+
+        app_factory = create_lwd_gateway_control_app
     servers = []
     for dp in cloud_dps:
-        app = create_lwd_cloud_control_app(
+        app = app_factory(
             bridge,
             lwd_config.instance.id,
             dp.dp_idx,
@@ -716,10 +786,11 @@ def start_lwd_cloud_control_server(
         )
     atexit.register(close)
     logger.info(
-        "[LWD] cloud control HTTP ready on %s ports=%s cloud_id=%s dp_size=%d",
+        "[LWD] cloud control HTTP ready on %s ports=%s cloud_id=%s dp_size=%d mode=%s",
         coord_cfg.listen_host,
         [dp.coord_port for dp in cloud_dps],
         lwd_config.instance.id,
         len(cloud_dps),
+        mode,
     )
     return command_queues, event_queue
