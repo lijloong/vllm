@@ -328,6 +328,7 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             client = self._lwd_coord_clients.get(dp_idx)
             if client is not None:
                 client.send_first_req()
+            request.lwd_request_notify_sent_at = time.monotonic()
             self._lwd_notify_request(dp_idx, request)
             self._lwd_probe_manager.mark_admitted(
                 request.request_id, getattr(request, "lwd_prefix_nonce", 0)

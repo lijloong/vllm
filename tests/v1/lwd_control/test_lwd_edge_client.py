@@ -14,6 +14,9 @@ from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_client import (
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_gateway_client import (
     LwdGatewayClient,
 )
+from vllm.v1.lwd_control.control_edge_scheduler.lwd_probe_runtime import (
+    LwdProbeStageMetrics,
+)
 from vllm.v1.lwd_control.lwd_comm.lwd_prefix import (
     HEADER_EDGE_ID,
     HEADER_PROBE_NONCE,
@@ -91,6 +94,7 @@ def test_direct_dp_probe_uses_logical_edge_and_closes_short_response() -> None:
     response = _Response(b"", _probe_message())
     session = _Session(response)
     client = LwdEdgePrefixClient("http://cloud1:8101", 4, b"tenant-key-16bytes")
+    metrics = LwdProbeStageMetrics()
 
     result = asyncio.run(
         client.probe(
@@ -101,10 +105,13 @@ def test_direct_dp_probe_uses_logical_edge_and_closes_short_response() -> None:
             cloud_id=1,
             dp_idx=1,
             probe_nonce=7,
+            metrics=metrics,
         )
     )
 
     assert result.hit_tokens == 4
+    assert metrics.response_headers_ms > 0
+    assert metrics.response_body_ms > 0
     assert result.engine_index == 1
     assert response.closed
     url, kwargs = session.calls[0]
@@ -228,6 +235,7 @@ def test_gateway_posts_complete_url_and_recovers_fragmented_startup_content() ->
         session = _Session(response)
         url = "https://gateway.example.com/tenant-a/v1/chat/completions?route=blue"
         client = LwdGatewayClient(url, 4, b"tenant-key-16bytes")
+        metrics = LwdProbeStageMetrics()
 
         activation = await client.activate_gateway(
             session,
@@ -236,10 +244,13 @@ def test_gateway_posts_complete_url_and_recovers_fragmented_startup_content() ->
             edge_id=3,
             model="test",
             max_tokens=1200,
+            metrics=metrics,
         )
         await activation.drain_task
 
         assert activation.result.cloud_id == 1
+        assert metrics.response_headers_ms > 0
+        assert metrics.startup_read_ms > 0
         assert activation.result.engine_index == 1
         assert activation.prefix_nonce == 9
         request_url, kwargs = session.calls[0]

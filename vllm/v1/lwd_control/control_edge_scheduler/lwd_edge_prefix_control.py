@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from typing import TYPE_CHECKING, Any
 
 from vllm.lwd_logger import lwd_logger
@@ -120,9 +121,20 @@ class LwdEdgePrefixControl:
             return True
         request, timer = self._pending.pop(reply.request_id)
         timer.cancel()
+        notify_sent_at = getattr(request, "lwd_request_notify_sent_at", None)
+        notify_ready_ms = (
+            (time.monotonic() - notify_sent_at) * 1000
+            if notify_sent_at is not None
+            else -1.0
+        )
+        if notify_sent_at is not None:
+            del request.lwd_request_notify_sent_at
         if reply.error:
             lwd_logger.error(
-                "[prefix] READY error req=%s: %s", reply.request_id, reply.error
+                "[prefix] READY error req=%s: %s notify_ready_ms=%.1f",
+                reply.request_id,
+                reply.error,
+                notify_ready_ms,
             )
             self._rollback_and_abort(request)
             return True
@@ -136,10 +148,12 @@ class LwdEdgePrefixControl:
             )
         if accepted:
             lwd_logger.info(
-                "[prefix] READY req=%s hit_tokens=%d replay_start=%d",
+                "[prefix] READY req=%s hit_tokens=%d replay_start=%d "
+                "notify_ready_ms=%.1f",
                 reply.request_id,
                 reply.hit_tokens,
                 reply.replay_start,
+                notify_ready_ms,
             )
             self._engine._lwd_enqueue_request(request)
         else:

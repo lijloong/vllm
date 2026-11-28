@@ -7,8 +7,9 @@ from __future__ import annotations
 import hashlib
 import queue
 import threading
+import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
@@ -22,6 +23,7 @@ from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_client import (
 )
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_probe_runtime import (
     LwdProbeRuntime,
+    LwdProbeStageMetrics,
 )
 from vllm.v1.lwd_control.lwd_comm.lwd_mm_identity import compute_processor_fingerprint
 from vllm.v1.lwd_control.lwd_comm.lwd_prefix import PROBE_HEADROOM_S, LwdProbeResult
@@ -79,6 +81,12 @@ class _InflightProbe:
     candidate: LwdProbeCandidate | None = None
     drain_task: Any = None
     cancelled: bool = False
+    submitted_at: float = field(default_factory=time.monotonic)
+    probe_metrics: list[LwdProbeStageMetrics] = field(default_factory=list)
+    probe_completed_at: float = 0.0
+    activate_metrics: LwdProbeStageMetrics | None = None
+    activate_submitted_at: float = 0.0
+    activate_completed_at: float = 0.0
 
 
 class LwdEdgeProbeManager:
@@ -214,23 +222,30 @@ class LwdEdgeProbeManager:
         coordination = self._vllm_config.lwd_config.coordination
         self._nonce += 1
         nonce = self._nonce
+        submitted_at = time.monotonic()
         media_items = self._media_items(request)
-        inflight = _InflightProbe(request, nonce, edge_id, media_items)
+        inflight = _InflightProbe(
+            request, nonce, edge_id, media_items, submitted_at=submitted_at
+        )
+        inflight.probe_metrics = [LwdProbeStageMetrics() for _ in targets]
         self._inflight[request.request_id] = inflight
         placement_only = not self._uses_prefix_hit(request)
 
-        async def one(target: LwdConnectionId) -> Any:
+        async def one(target: LwdConnectionId, metrics: LwdProbeStageMetrics) -> Any:
+            metrics.runtime_queue_ms = (time.monotonic() - submitted_at) * 1000
             session = await runtime.ensure_session()
             block_size = self._hash_sizes.get(
                 (target.cloud_id, target.dp_idx),
                 self._vllm_config.cache_config.block_size,
             )
             client = self._client(target, block_size)
+            manifest_started = time.monotonic()
             manifest = client.build_manifest(
                 request.request_id,
                 list(request.prompt_token_ids),
                 media_items=media_items,
             )
+            metrics.manifest_build_ms = (time.monotonic() - manifest_started) * 1000
             try:
                 result = await client.probe(
                     session,
@@ -243,13 +258,17 @@ class LwdEdgeProbeManager:
                     manifest=manifest,
                     media_items=media_items,
                     model=self._model_name(),
+                    metrics=metrics,
                 )
                 chain = None if placement_only else list(manifest.full_block_hashes)
                 return target, result, chain, block_size, None
             except Exception as exc:  # noqa: BLE001
                 return target, None, None, block_size, exc
 
-        batch_coroutines = [one(target) for target in targets]
+        batch_coroutines = [
+            one(target, metrics)
+            for target, metrics in zip(targets, inflight.probe_metrics, strict=True)
+        ]
         try:
             future = runtime.submit_group(batch_coroutines)
         except Exception:
@@ -273,6 +292,7 @@ class LwdEdgeProbeManager:
 
         def done(future: Any) -> None:
             timer.cancel()
+            inflight.probe_completed_at = time.monotonic()
             try:
                 outcome = future.result()
             except BaseException as exc:
@@ -313,15 +333,23 @@ class LwdEdgeProbeManager:
         client = self._client(connection_id, block_size)
         inflight.connection_id = connection_id
         inflight.candidate = candidate
+        metrics = LwdProbeStageMetrics()
+        inflight.activate_metrics = metrics
+        inflight.activate_submitted_at = time.monotonic()
 
         async def job() -> str | None:
             try:
+                metrics.runtime_queue_ms = (
+                    time.monotonic() - inflight.activate_submitted_at
+                ) * 1000
                 session = await runtime.ensure_session()
+                manifest_started = time.monotonic()
                 manifest = client.build_manifest(
                     request.request_id,
                     list(request.prompt_token_ids),
                     media_items=inflight.media_items,
                 )
+                metrics.manifest_build_ms = (time.monotonic() - manifest_started) * 1000
                 drain_task = await client.activate(
                     session,
                     request.request_id,
@@ -333,6 +361,7 @@ class LwdEdgeProbeManager:
                     manifest=manifest,
                     media_items=inflight.media_items,
                     model=self._model_name(),
+                    metrics=metrics,
                 )
                 inflight.drain_task = drain_task
                 if (
@@ -348,6 +377,7 @@ class LwdEdgeProbeManager:
         inflight.future = future
 
         def done(future: Any) -> None:
+            inflight.activate_completed_at = time.monotonic()
             try:
                 error = future.result()
             except BaseException as exc:
@@ -361,6 +391,13 @@ class LwdEdgeProbeManager:
     def mark_admitted(self, request_id: str, nonce: int) -> None:
         inflight = self._inflight.get(request_id)
         if inflight is not None and inflight.nonce == nonce:
+            logger.info(
+                "[LWD][perf][edge][direct] admitted req=%s nonce=%d "
+                "negotiation_ms=%.1f",
+                request_id,
+                nonce,
+                (time.monotonic() - inflight.submitted_at) * 1000,
+            )
             self._inflight.pop(request_id, None)
 
     def abort(self, request_id: str) -> None:
@@ -384,6 +421,22 @@ class LwdEdgeProbeManager:
             if inflight is None or inflight.nonce != nonce:
                 continue
             if kind == "activate":
+                now = time.monotonic()
+                metrics = inflight.activate_metrics
+                if metrics is not None:
+                    logger.info(
+                        "[LWD][perf][edge][direct] activate req=%s nonce=%d "
+                        "total_ms=%.1f dispatch_ms=%.1f queue_ms=%.1f "
+                        "manifest_ms=%.1f response_headers_ms=%.1f ok=%s",
+                        request_id,
+                        nonce,
+                        (now - inflight.activate_submitted_at) * 1000,
+                        (now - inflight.activate_completed_at) * 1000,
+                        metrics.runtime_queue_ms,
+                        metrics.manifest_build_ms,
+                        metrics.response_headers_ms,
+                        outcome is None,
+                    )
                 connection_id = inflight.connection_id
                 candidate = inflight.candidate
                 completions.append(
@@ -417,6 +470,27 @@ class LwdEdgeProbeManager:
                     )
                     chain = list(rebuilt.full_block_hashes)
                 candidates.append(LwdProbeCandidate(target, result, chain))
+            now = time.monotonic()
+            metrics = inflight.probe_metrics
+            logger.info(
+                "[LWD][perf][edge][direct] probe_batch req=%s nonce=%d "
+                "total_ms=%.1f dispatch_ms=%.1f targets=%d succeeded=%d "
+                "failed=%d queue_max_ms=%.1f manifest_max_ms=%.1f "
+                "manifest_sum_ms=%.1f response_headers_max_ms=%.1f "
+                "response_body_max_ms=%.1f",
+                request_id,
+                nonce,
+                (now - inflight.submitted_at) * 1000,
+                (now - inflight.probe_completed_at) * 1000,
+                len(metrics),
+                len(candidates),
+                len(failed),
+                max((item.runtime_queue_ms for item in metrics), default=0.0),
+                max((item.manifest_build_ms for item in metrics), default=0.0),
+                sum(item.manifest_build_ms for item in metrics),
+                max((item.response_headers_ms for item in metrics), default=0.0),
+                max((item.response_body_ms for item in metrics), default=0.0),
+            )
             completions.append(
                 LwdProbeCompletion(
                     inflight.request,

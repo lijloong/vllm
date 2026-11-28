@@ -9,9 +9,19 @@ import contextlib
 import threading
 from collections.abc import Coroutine
 from concurrent.futures import Future
+from dataclasses import dataclass
 from typing import Any
 
 import aiohttp
+
+
+@dataclass(slots=True)
+class LwdProbeStageMetrics:
+    runtime_queue_ms: float = 0.0
+    manifest_build_ms: float = 0.0
+    response_headers_ms: float = 0.0
+    response_body_ms: float = 0.0
+    startup_read_ms: float = 0.0
 
 
 class LwdProbeRuntime:

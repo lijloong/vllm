@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
+import logging
 import threading
 import time
 from types import SimpleNamespace
@@ -143,8 +144,12 @@ def _drain(manager: LwdEdgeProbeManager, activated: bool = False):
     [(True, 2, 2), (False, 1, 1)],
 )
 def test_submit_fans_out_only_for_prefix_and_activates_winner(
-    prefix_enabled: bool, expected_probes: int, expected_concurrency: int
+    prefix_enabled: bool,
+    expected_probes: int,
+    expected_concurrency: int,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
+    caplog.set_level(logging.INFO)
     manager = LwdEdgeProbeManager(_config(prefix_enabled), lambda: None)
     calls: list[tuple[int, int]] = []
     activity = {"active": 0, "max_active": 0}
@@ -168,6 +173,20 @@ def test_submit_fans_out_only_for_prefix_and_activates_winner(
         assert activated.probe_nonce == completion.probe_nonce
         manager.mark_admitted("req", activated.probe_nonce)
         assert not manager._inflight
+        messages = [record.message for record in caplog.records]
+        assert any(
+            "probe_batch" in message
+            and "manifest_sum_ms=" in message
+            and "response_headers_max_ms=" in message
+            for message in messages
+        )
+        assert any(
+            "activate" in message and "dispatch_ms=" in message for message in messages
+        )
+        assert any(
+            "admitted" in message and "negotiation_ms=" in message
+            for message in messages
+        )
     finally:
         manager.close()
 
@@ -400,7 +419,10 @@ def _gateway_config() -> SimpleNamespace:
     return config
 
 
-def test_gateway_binds_returned_dp_without_edge_preselection() -> None:
+def test_gateway_binds_returned_dp_without_edge_preselection(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO)
     manager = LwdGatewayActivationManager(_gateway_config(), lambda: None)
     calls: list[tuple[int, int]] = []
     activity = {"active": 0, "max_active": 0}
@@ -416,6 +438,12 @@ def test_gateway_binds_returned_dp_without_edge_preselection() -> None:
         assert completion.probe_nonce == 9
         assert calls == [(99, 99)]
         assert activity["max_tokens"] == 32
+        assert any(
+            "[LWD][perf][edge][gateway] activate" in record.message
+            and "response_headers_ms=" in record.message
+            and "startup_read_ms=" in record.message
+            for record in caplog.records
+        )
 
         drain_task = manager._inflight["req"].drain_task
         manager.abort("req")

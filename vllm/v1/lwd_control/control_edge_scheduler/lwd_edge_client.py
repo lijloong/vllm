@@ -8,11 +8,15 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from collections.abc import AsyncIterable, AsyncIterator, Mapping, Sequence
 from typing import Any
 
 from vllm import envs
 from vllm.logger import init_logger
+from vllm.v1.lwd_control.control_edge_scheduler.lwd_probe_runtime import (
+    LwdProbeStageMetrics,
+)
 from vllm.v1.lwd_control.lwd_comm.lwd_mm_identity import (
     mm_abi_header_value,
     negotiate_lwd_protocol,
@@ -165,6 +169,7 @@ class LwdEdgePrefixClient:
         manifest: LwdPrefixManifest | None = None,
         media_items: Sequence[Any] = (),
         model: str | None = None,
+        metrics: LwdProbeStageMetrics | None = None,
     ) -> LwdProbeResult:
         """Run one short, read-only probe against this client's DP."""
         if manifest is None:
@@ -179,7 +184,11 @@ class LwdEdgePrefixClient:
         )
         headers[HEADER_CLOUD_ID] = str(cloud_id)
         headers[HEADER_ENGINE_INDEX] = str(dp_idx)
+        request_started = time.monotonic()
         response = await self._post("/v1/lwd/probe", session, headers, body)
+        response_started = time.monotonic()
+        if metrics is not None:
+            metrics.response_headers_ms = (response_started - request_started) * 1000
         try:
             if response.status != 200:
                 detail = await self._read_error_body(response)
@@ -195,6 +204,8 @@ class LwdEdgePrefixClient:
                     f"expected=({cloud_id}, {dp_idx}) "
                     f"actual=({probe.cloud_id}, {probe.engine_index})"
                 )
+            if metrics is not None:
+                metrics.response_body_ms = (time.monotonic() - response_started) * 1000
             return probe
         finally:
             response.close()
@@ -212,6 +223,7 @@ class LwdEdgePrefixClient:
         manifest: LwdPrefixManifest | None = None,
         media_items: Sequence[Any] = (),
         model: str | None = None,
+        metrics: LwdProbeStageMetrics | None = None,
     ) -> asyncio.Task[None]:
         """Register usage before RequestNotify, then drain the winner stream."""
         if manifest is None:
@@ -227,7 +239,10 @@ class LwdEdgePrefixClient:
         headers["Accept"] = "text/event-stream"
         headers[HEADER_CLOUD_ID] = str(cloud_id)
         headers[HEADER_ENGINE_INDEX] = str(dp_idx)
+        request_started = time.monotonic()
         response = await self._post("/v1/lwd/activate", session, headers, body)
+        if metrics is not None:
+            metrics.response_headers_ms = (time.monotonic() - request_started) * 1000
         if response.status != 200:
             try:
                 detail = await self._read_error_body(response)

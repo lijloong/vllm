@@ -5,8 +5,9 @@
 from __future__ import annotations
 
 import queue
+import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from dataclasses import replace as dataclass_replace
 from typing import Any, cast
 
@@ -22,6 +23,7 @@ from vllm.v1.lwd_control.control_edge_scheduler.lwd_gateway_client import (
 )
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_probe_runtime import (
     LwdProbeRuntime,
+    LwdProbeStageMetrics,
 )
 from vllm.v1.lwd_control.lwd_comm.lwd_messages import LWD_SAMPLING_DEFAULTS
 from vllm.v1.lwd_control.lwd_comm.lwd_mm_identity import compute_processor_fingerprint
@@ -40,6 +42,9 @@ class _LwdInflightGateway:
     connection_id: LwdConnectionId | None = None
     drain_task: Any = None
     prefix_nonce: int = 0
+    submitted_at: float = field(default_factory=time.monotonic)
+    completed_at: float = 0.0
+    metrics: LwdProbeStageMetrics = field(default_factory=LwdProbeStageMetrics)
 
 
 class LwdGatewayActivationManager:
@@ -197,8 +202,11 @@ class LwdGatewayActivationManager:
         coordination = self._vllm_config.lwd_config.coordination
         self._generation += 1
         generation = self._generation
+        submitted_at = time.monotonic()
         media_items = LwdEdgeProbeManager._media_items(request)
-        inflight = _LwdInflightGateway(request, generation, edge_id, media_items)
+        inflight = _LwdInflightGateway(
+            request, generation, edge_id, media_items, submitted_at=submitted_at
+        )
         self._inflight[request.request_id] = inflight
         placement_only = not self._uses_prefix_hit(request)
         max_tokens = getattr(request.sampling_params, "max_tokens", None)
@@ -206,14 +214,18 @@ class LwdGatewayActivationManager:
             max_tokens = cast(int, LWD_SAMPLING_DEFAULTS["max_tokens"])
 
         async def job() -> tuple[Any, ...]:
+            metrics = inflight.metrics
+            metrics.runtime_queue_ms = (time.monotonic() - submitted_at) * 1000
             session = await runtime.ensure_session()
             block_size = self._block_size()
             client = self._client(url, block_size)
+            manifest_started = time.monotonic()
             manifest = client.build_manifest(
                 request.request_id,
                 list(request.prompt_token_ids),
                 media_items=media_items,
             )
+            metrics.manifest_build_ms = (time.monotonic() - manifest_started) * 1000
             activation = await client.activate_gateway(
                 session,
                 request.request_id,
@@ -223,6 +235,7 @@ class LwdGatewayActivationManager:
                 media_items=media_items,
                 model=self._model_name(),
                 max_tokens=max_tokens,
+                metrics=metrics,
             )
             if self._inflight.get(request.request_id) is inflight:
                 inflight.drain_task = activation.drain_task
@@ -246,6 +259,7 @@ class LwdGatewayActivationManager:
         inflight.future = future
 
         def done(future: Any) -> None:
+            inflight.completed_at = time.monotonic()
             try:
                 outcome = future.result()
             except BaseException as exc:
@@ -266,6 +280,13 @@ class LwdGatewayActivationManager:
     def mark_admitted(self, request_id: str, nonce: int) -> None:
         inflight = self._inflight.get(request_id)
         if inflight is not None and inflight.prefix_nonce == nonce:
+            logger.info(
+                "[LWD][perf][edge][gateway] admitted req=%s nonce=%d "
+                "negotiation_ms=%.1f",
+                request_id,
+                nonce,
+                (time.monotonic() - inflight.submitted_at) * 1000,
+            )
             self._inflight.pop(request_id, None)
 
     def abort(self, request_id: str) -> None:
@@ -285,6 +306,23 @@ class LwdGatewayActivationManager:
             inflight = self._inflight.get(request_id)
             if inflight is None or inflight.generation != generation:
                 continue
+            now = time.monotonic()
+            metrics = inflight.metrics
+            logger.info(
+                "[LWD][perf][edge][gateway] activate req=%s generation=%d "
+                "total_ms=%.1f dispatch_ms=%.1f queue_ms=%.1f "
+                "manifest_ms=%.1f response_headers_ms=%.1f "
+                "startup_read_ms=%.1f ok=%s",
+                request_id,
+                generation,
+                (now - inflight.submitted_at) * 1000,
+                (now - inflight.completed_at) * 1000,
+                metrics.runtime_queue_ms,
+                metrics.manifest_build_ms,
+                metrics.response_headers_ms,
+                metrics.startup_read_ms,
+                not isinstance(outcome, str),
+            )
             if isinstance(outcome, str):
                 completions.append(
                     LwdProbeCompletion(

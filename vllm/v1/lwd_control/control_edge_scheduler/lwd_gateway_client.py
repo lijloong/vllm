@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import time
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -14,6 +15,9 @@ from typing import Any
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_client import (
     LwdEdgePrefixClient,
     _iter_sse_data,
+)
+from vllm.v1.lwd_control.control_edge_scheduler.lwd_probe_runtime import (
+    LwdProbeStageMetrics,
 )
 from vllm.v1.lwd_control.lwd_comm.lwd_prefix import (
     GATEWAY_USAGE_EXECUTION_TIMEOUT_S,
@@ -75,6 +79,7 @@ class LwdGatewayClient(LwdEdgePrefixClient):
         manifest: LwdPrefixManifest | None = None,
         media_items: Sequence[Any] = (),
         max_tokens: int | None = None,
+        metrics: LwdProbeStageMetrics | None = None,
     ) -> LwdGatewayActivation:
         """Return only after the startup content identifies the serving DP."""
         if manifest is None:
@@ -89,7 +94,11 @@ class LwdGatewayClient(LwdEdgePrefixClient):
         headers[HEADER_USAGE_EXECUTION_TIMEOUT_MS] = str(
             self._usage_execution_timeout_ms(max_tokens)
         )
+        request_started = time.monotonic()
         response = await self._post_url(self._control_url, session, headers, body)
+        response_started = time.monotonic()
+        if metrics is not None:
+            metrics.response_headers_ms = (response_started - request_started) * 1000
         if response.status != 200:
             try:
                 detail = await self._read_error_body(response)
@@ -109,6 +118,8 @@ class LwdGatewayClient(LwdEdgePrefixClient):
         except BaseException:
             response.close()
             raise
+        if metrics is not None:
+            metrics.startup_read_ms = (time.monotonic() - response_started) * 1000
         drain_task = self._start_drain(request_id, response, sse_data)
         return LwdGatewayActivation(probe, prefix_nonce, drain_task)
 
